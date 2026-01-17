@@ -35,28 +35,33 @@ class FileService {
     return `${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
   }
 
-  // Pick document
-  async pickDocument(): Promise<FileMetadata | null> {
+  // Pick document(s)
+  async pickDocument(): Promise<FileMetadata[]> {
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: "*/*",
         copyToCacheDirectory: true,
+        multiple: true,
       });
 
       if (result.canceled) {
-        return null;
+        return [];
       }
 
-      const file = result.assets[0];
-      return await this.secureFile(
-        file.uri,
-        file.name,
-        file.mimeType || "application/octet-stream",
-        file.size || 0,
-      );
+      const files: FileMetadata[] = [];
+      for (const file of result.assets) {
+        const metadata = await this.secureFile(
+          file.uri,
+          file.name,
+          file.mimeType || "application/octet-stream",
+          file.size || 0,
+        );
+        files.push(metadata);
+      }
+      return files;
     } catch (error) {
       console.error("Document picker error:", error);
-      return null;
+      return [];
     }
   }
 
@@ -83,8 +88,10 @@ class FileService {
       for (const asset of result.assets) {
         const fileName = asset.uri.split("/").pop() || "image.jpg";
         const fileSize = asset.fileSize || 0;
-        const mimeType = asset.mimeType || (asset.type === 'video' ? 'video/mp4' : 'image/jpeg');
-        
+        const mimeType =
+          asset.mimeType ||
+          (asset.type === "video" ? "video/mp4" : "image/jpeg");
+
         const metadata = await this.secureFile(
           asset.uri,
           fileName,

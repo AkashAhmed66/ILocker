@@ -1,9 +1,10 @@
-import SecurityService from '@/services/SecurityService';
-import { DarkTheme, ThemeProvider } from '@react-navigation/native';
-import { Stack, useRouter, useSegments } from 'expo-router';
-import { StatusBar } from 'expo-status-bar';
-import { useEffect, useState } from 'react';
-import 'react-native-reanimated';
+import SplashScreen from "@/components/SplashScreen";
+import SecurityService from "@/services/SecurityService";
+import { DarkTheme, ThemeProvider } from "@react-navigation/native";
+import { Stack, useRouter, useSegments } from "expo-router";
+import { StatusBar } from "expo-status-bar";
+import { useEffect, useState } from "react";
+import "react-native-reanimated";
 
 function useProtectedRoute() {
   const segments = useSegments();
@@ -19,17 +20,18 @@ function useProtectedRoute() {
       const { isSecure, reason } = await SecurityService.checkDeviceSecurity();
       if (!isSecure) {
         // In production, you might want to block access
-        console.warn('Device security compromised:', reason);
+        console.warn("Device security compromised:", reason);
       }
 
-      const inAuthGroup = segments[0] === 'login' || segments[0] === 'set-password';
+      const inAuthGroup =
+        segments[0] === "login" || segments[0] === "set-password";
 
-      if (!isPasswordSet && segments[0] !== 'set-password') {
-        router.replace('/set-password');
-      } else if (isPasswordSet && !isAuthenticated && segments[0] !== 'login') {
-        router.replace('/login');
+      if (!isPasswordSet && segments[0] !== "set-password") {
+        router.replace("/set-password");
+      } else if (isPasswordSet && !isAuthenticated && segments[0] !== "login") {
+        router.replace("/login");
       } else if (isPasswordSet && isAuthenticated && inAuthGroup) {
-        router.replace('/home');
+        router.replace("/home");
       }
 
       setIsReady(true);
@@ -43,6 +45,11 @@ function useProtectedRoute() {
 
 export default function RootLayout() {
   const isReady = useProtectedRoute();
+  const [showSplash, setShowSplash] = useState(true);
+
+  if (showSplash) {
+    return <SplashScreen onFinish={() => setShowSplash(false)} />;
+  }
 
   if (!isReady) {
     return null;

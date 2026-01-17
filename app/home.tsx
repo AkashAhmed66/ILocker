@@ -6,18 +6,18 @@ import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import React, { useCallback, useEffect, useState } from "react";
 import {
-    ActivityIndicator,
-    Alert,
-    FlatList,
-    Image,
-    Modal,
-    RefreshControl,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  Image,
+  Modal,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -73,9 +73,10 @@ export default function HomeScreen() {
 
       if (results.length > 0) {
         loadFiles();
-        const message = results.length === 1 
-          ? "File encrypted and stored securely" 
-          : `${results.length} files encrypted and stored securely`;
+        const message =
+          results.length === 1
+            ? "File encrypted and stored securely"
+            : `${results.length} files encrypted and stored securely`;
         Alert.alert("Success", message);
       }
     } catch (error: any) {
