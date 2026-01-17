@@ -16,7 +16,9 @@
         "NSCameraUsageDescription": "ILocker needs camera access to capture and encrypt photos",
         "NSPhotoLibraryUsageDescription": "ILocker needs access to your photo library to encrypt and secure your images",
         "NSPhotoLibraryAddUsageDescription": "ILocker needs permission to save decrypted files to your photo library",
-        "UIBackgroundModes": ["fetch"],
+        "UIBackgroundModes": [
+          "fetch"
+        ],
         "ITSAppUsesNonExemptEncryption": false
       }
     },
@@ -60,11 +62,19 @@
           }
         }
       ],
-      ["expo-secure-store"]
+      [
+        "expo-secure-store"
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "777b6d83-09c7-4785-b890-29586970a63a"
+      }
     }
   }
 }
