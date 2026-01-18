@@ -4,7 +4,7 @@
     "slug": "ILocker",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/app-icon.png",
+    "icon": "./assets/images/app-icon.jpeg",
     "scheme": "ilocker",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
@@ -37,9 +37,9 @@
       "allowBackup": false,
       "adaptiveIcon": {
         "backgroundColor": "#0f0f0f",
-        "foregroundImage": "./assets/images/app-icon.png",
-        "backgroundImage": "./assets/images/app-icon.png",
-        "monochromeImage": "./assets/images/app-icon.png"
+        "foregroundImage": "./assets/images/app-icon.jpeg",
+        "backgroundImage": "./assets/images/app-icon.jpeg",
+        "monochromeImage": "./assets/images/app-icon.jpeg"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false
@@ -53,7 +53,7 @@
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/app-icon.png",
+          "image": "./assets/images/app-icon.jpeg",
           "imageWidth": 200,
           "resizeMode": "contain",
           "backgroundColor": "#0f0f0f",
