@@ -29,10 +29,13 @@ export default function LoginScreen() {
 
     setLoading(true);
     try {
+      // Try to restore master key first (fast path)
+      const restored = await SecurityService.restoreMasterKey();
+      
+      // Verify password
       const isValid = await SecurityService.verifyPassword(password);
       if (isValid) {
-        // Small delay to ensure master key is fully set
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        // Master key is now set, navigate immediately
         router.replace("/home");
       } else {
         Alert.alert("Error", "Incorrect password. Please try again.");

@@ -32,7 +32,8 @@
         "WRITE_EXTERNAL_STORAGE",
         "READ_MEDIA_IMAGES",
         "READ_MEDIA_VIDEO",
-        "ACCESS_MEDIA_LOCATION"
+        "ACCESS_MEDIA_LOCATION",
+        "POST_NOTIFICATIONS"
       ],
       "allowBackup": false,
       "adaptiveIcon": {
@@ -64,6 +65,16 @@
       ],
       [
         "expo-secure-store"
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/app-icon.jpeg",
+          "color": "#4a90e2",
+          "sounds": [],
+          "androidMode": "default",
+          "androidCollapsedTitle": "ILocker Operations"
+        }
       ]
     ],
     "experiments": {

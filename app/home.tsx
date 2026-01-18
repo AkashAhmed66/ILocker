@@ -1,23 +1,23 @@
 import SimpleIcon from "@/components/SimpleIcon";
-import FileService from "@/services/FileService";
+import FileService, { FileOperation } from "@/services/FileService";
 import SecurityService, { FileMetadata } from "@/services/SecurityService";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import React, { useCallback, useEffect, useState } from "react";
 import {
-  ActivityIndicator,
-  Alert,
-  FlatList,
-  Image,
-  Modal,
-  RefreshControl,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    Alert,
+    FlatList,
+    Image,
+    Modal,
+    RefreshControl,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -34,11 +34,20 @@ export default function HomeScreen() {
   const [confirmNewPassword, setConfirmNewPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [activeOperations, setActiveOperations] = useState<FileOperation[]>([]);
+  const [previewProgress, setPreviewProgress] = useState(0);
 
   useEffect(() => {
     // Load files and initialize storage (authentication already verified by _layout.tsx)
     loadFiles();
     FileService.initializeSecureStorage();
+    
+    // Poll for active operations
+    const interval = setInterval(() => {
+      setActiveOperations(FileService.getActiveOperations());
+    }, 500);
+    
+    return () => clearInterval(interval);
   }, []);
 
   const loadFiles = () => {
@@ -54,7 +63,6 @@ export default function HomeScreen() {
 
   const handleAddFile = async (type: "document" | "image" | "camera") => {
     setShowMenu(false);
-    setLoading(true);
     try {
       let results: FileMetadata[] = [];
 
@@ -73,18 +81,12 @@ export default function HomeScreen() {
 
       if (results.length > 0) {
         loadFiles();
-        const message =
-          results.length === 1
-            ? "File encrypted and stored securely"
-            : `${results.length} files encrypted and stored securely`;
-        Alert.alert("Success", message);
+        // Operations will show progress automatically via activeOperations
       }
     } catch (error: any) {
       console.error("Add file error:", error);
       const errorMsg = error?.message || "Failed to add file";
       Alert.alert("Error", errorMsg);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -92,10 +94,25 @@ export default function HomeScreen() {
     setSelectedFile(file);
     setLoading(true);
     setShowFilePreview(true);
+    setPreviewContent(null);
+    setPreviewProgress(0);
 
     try {
-      const content = await FileService.readSecureFile(file.id);
+      // For images, try to load thumbnail first for instant preview
+      if (file.fileType.startsWith("image/") && file.encryptedThumbnail) {
+        const thumbnail = await FileService.getThumbnail(file.id);
+        if (thumbnail) {
+          setPreviewContent(thumbnail);
+          setLoading(false);
+        }
+      }
+
+      // Load full content with progress
+      const content = await FileService.readSecureFile(file.id, (progress) => {
+        setPreviewProgress(progress);
+      });
       setPreviewContent(content);
+      setPreviewProgress(100);
     } catch (error) {
       Alert.alert("Error", "Failed to decrypt file");
       setShowFilePreview(false);
@@ -170,19 +187,17 @@ export default function HomeScreen() {
   };
 
   const handleDownloadFile = async (file: FileMetadata) => {
-    setLoading(true);
     try {
       const result = await FileService.downloadFile(file.id);
       if (result.success) {
-        Alert.alert("Success", result.message);
+        // Download started in background - show toast
+        Alert.alert("Download Started", result.message);
       } else {
         Alert.alert("Error", result.message);
       }
     } catch (error) {
       console.error("Download error:", error);
-      Alert.alert("Error", "Failed to download file");
-    } finally {
-      setLoading(false);
+      Alert.alert("Error", "Failed to start download");
     }
   };
 
@@ -258,6 +273,43 @@ export default function HomeScreen() {
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* Active Operations Progress */}
+        {activeOperations.length > 0 && (
+          <View style={styles.operationsContainer}>
+            {activeOperations.map((op) => (
+              <View key={op.id} style={styles.operationCard}>
+                <View style={styles.operationHeader}>
+                  <SimpleIcon 
+                    name={op.type === 'upload' ? 'cloud-upload-outline' : 'cloud-download-outline'} 
+                    size={20} 
+                    color="#4a90e2" 
+                  />
+                  <Text style={styles.operationName} numberOfLines={1}>
+                    {op.fileName}
+                  </Text>
+                  <Text style={styles.operationPercent}>
+                    {Math.round(op.progress)}%
+                  </Text>
+                </View>
+                <View style={styles.progressBarBg}>
+                  <View 
+                    style={[
+                      styles.progressBarFill, 
+                      { 
+                        width: `${op.progress}%`,
+                        backgroundColor: op.status === 'failed' ? '#ff4444' : '#4a90e2'
+                      }
+                    ]} 
+                  />
+                </View>
+                {op.status === 'failed' && (
+                  <Text style={styles.operationError}>{op.error}</Text>
+                )}
+              </View>
+            ))}
+          </View>
+        )}
 
         {/* File List */}
         {files.length === 0 ? (
@@ -433,7 +485,16 @@ export default function HomeScreen() {
               {loading ? (
                 <View style={styles.loadingContainer}>
                   <ActivityIndicator size="large" color="#4a90e2" />
-                  <Text style={styles.loadingText}>Decrypting...</Text>
+                  <Text style={styles.loadingText}>
+                    Decrypting... {Math.round(previewProgress)}%
+                  </Text>
+                  {previewProgress > 0 && (
+                    <View style={styles.progressBarBg}>
+                      <View 
+                        style={[styles.progressBarFill, { width: `${previewProgress}%` }]} 
+                      />
+                    </View>
+                  )}
                 </View>
               ) : (
                 <View style={styles.previewContainer}>
@@ -507,6 +568,52 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: "#888",
     marginTop: 4,
+  },
+  operationsContainer: {
+    paddingHorizontal: 20,
+    paddingBottom: 10,
+  },
+  operationCard: {
+    backgroundColor: "#1a1a2e",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: "#2a2a3e",
+  },
+  operationHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  operationName: {
+    flex: 1,
+    fontSize: 14,
+    color: "#fff",
+    marginLeft: 8,
+  },
+  operationPercent: {
+    fontSize: 12,
+    color: "#4a90e2",
+    fontWeight: "bold",
+  },
+  operationError: {
+    fontSize: 12,
+    color: "#ff4444",
+    marginTop: 4,
+  },
+  progressBarBg: {
+    height: 4,
+    backgroundColor: "#2a2a3e",
+    borderRadius: 2,
+    overflow: "hidden",
+    width: "100%",
+    marginTop: 4,
+  },
+  progressBarFill: {
+    height: "100%",
+    backgroundColor: "#4a90e2",
+    borderRadius: 2,
   },
   headerButtons: {
     flexDirection: "row",

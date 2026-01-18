@@ -2,19 +2,50 @@ import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
 import * as MediaLibrary from "expo-media-library";
+import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 import "react-native-get-random-values";
 import SecurityService, { FileMetadata } from "./SecurityService";
 
+// Configure notifications
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
+
+export interface FileOperation {
+  id: string;
+  type: 'upload' | 'download';
+  fileName: string;
+  progress: number;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  error?: string;
+}
+
 class FileService {
   private readonly SECURE_DIR = `${FileSystem.documentDirectory || "file:///"}secure/`;
+  private readonly THUMBNAIL_DIR = `${FileSystem.documentDirectory || "file:///"}thumbnails/`;
+  private activeOperations: Map<string, FileOperation> = new Map();
+  private operationListeners: Map<string, (op: FileOperation) => void> = new Map();
 
   // Initialize secure directory
   async initializeSecureStorage(): Promise<void> {
     try {
+      // Create secure directory
       const dirInfo = await FileSystem.getInfoAsync(this.SECURE_DIR);
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.SECURE_DIR, {
+          intermediates: true,
+        });
+      }
+
+      // Create thumbnail directory
+      const thumbInfo = await FileSystem.getInfoAsync(this.THUMBNAIL_DIR);
+      if (!thumbInfo.exists) {
+        await FileSystem.makeDirectoryAsync(this.THUMBNAIL_DIR, {
           intermediates: true,
         });
       }
@@ -25,8 +56,64 @@ class FileService {
       if (!nomediaInfo.exists) {
         await FileSystem.writeAsStringAsync(nomediaPath, "");
       }
+
+      // Request notification permissions
+      await this.requestNotificationPermissions();
     } catch (error) {
       console.warn("Failed to initialize secure storage:", error);
+    }
+  }
+
+  // Request notification permissions
+  private async requestNotificationPermissions(): Promise<void> {
+    try {
+      const { status: existingStatus } = await Notifications.getPermissionsAsync();
+      let finalStatus = existingStatus;
+      
+      if (existingStatus !== 'granted') {
+        const { status } = await Notifications.requestPermissionsAsync();
+        finalStatus = status;
+      }
+      
+      if (finalStatus !== 'granted') {
+        console.warn('Notification permissions not granted');
+      }
+    } catch (error) {
+      console.warn('Failed to request notification permissions:', error);
+    }
+  }
+
+  // Subscribe to operation updates
+  subscribeToOperation(operationId: string, callback: (op: FileOperation) => void): () => void {
+    this.operationListeners.set(operationId, callback);
+    return () => this.operationListeners.delete(operationId);
+  }
+
+  // Update operation status
+  private updateOperation(operationId: string, updates: Partial<FileOperation>): void {
+    const operation = this.activeOperations.get(operationId);
+    if (operation) {
+      Object.assign(operation, updates);
+      const listener = this.operationListeners.get(operationId);
+      if (listener) {
+        listener(operation);
+      }
+    }
+  }
+
+  // Show notification
+  private async showNotification(title: string, body: string): Promise<void> {
+    try {
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title,
+          body,
+          sound: true,
+        },
+        trigger: null, // Show immediately
+      });
+    } catch (error) {
+      console.warn('Failed to show notification:', error);
     }
   }
 
@@ -135,7 +222,7 @@ class FileService {
     }
   }
 
-  // Encrypt and store file securely
+  // Encrypt and store file securely (with progress tracking)
   private async secureFile(
     sourceUri: string,
     originalName: string,
@@ -145,56 +232,164 @@ class FileService {
     await this.initializeSecureStorage();
 
     const fileId = this.generateFileId();
-    const encryptedFileName = `${fileId}.enc`;
-    const encryptedPath = `${this.SECURE_DIR}${encryptedFileName}`;
-
-    // Read file content
-    const fileContent = await FileSystem.readAsStringAsync(sourceUri, {
-      encoding: "base64" as any,
-    });
-
-    // Encrypt file content
-    const encryptedContent = SecurityService.encryptData(fileContent, fileId);
-
-    // Write encrypted file
-    await FileSystem.writeAsStringAsync(encryptedPath, encryptedContent, {
-      encoding: "utf8" as any,
-    });
-
-    // Generate encrypted thumbnail if image
-    let encryptedThumbnail: string | undefined;
-    if (fileType.startsWith("image/")) {
-      // Use first 1000 chars as thumbnail placeholder
-      encryptedThumbnail = encryptedContent.substring(0, 1000);
-    }
-
-    const metadata: FileMetadata = {
-      id: fileId,
-      originalName,
-      encryptedPath,
-      fileType,
-      size,
-      encryptedThumbnail,
-      timestamp: Date.now(),
+    const operationId = fileId;
+    
+    // Create operation tracker
+    const operation: FileOperation = {
+      id: operationId,
+      type: 'upload',
+      fileName: originalName,
+      progress: 0,
+      status: 'processing',
     };
+    this.activeOperations.set(operationId, operation);
 
-    // Store metadata
-    SecurityService.storeFileMetadata(metadata);
-
-    // Delete original file if it was copied to cache
     try {
-      if (sourceUri.includes("cache")) {
-        await FileSystem.deleteAsync(sourceUri, { idempotent: true });
-      }
-    } catch (error) {
-      console.warn("Could not delete cached file:", error);
-    }
+      const encryptedFileName = `${fileId}.enc`;
+      const encryptedPath = `${this.SECURE_DIR}${encryptedFileName}`;
 
-    return metadata;
+      // Update progress: Reading file
+      this.updateOperation(operationId, { progress: 10 });
+
+      // Read file content
+      const fileContent = await FileSystem.readAsStringAsync(sourceUri, {
+        encoding: "base64" as any,
+      });
+
+      // Update progress: Encrypting
+      this.updateOperation(operationId, { progress: 30 });
+
+      // Encrypt file content with progress (use chunked for large files)
+      let encryptedContent: string;
+      if (fileContent.length > 1000000) { // > 1MB use chunked
+        encryptedContent = await SecurityService.encryptDataChunked(
+          fileContent,
+          fileId,
+          (chunkProgress) => {
+            this.updateOperation(operationId, { 
+              progress: 30 + (chunkProgress * 0.5) // 30-80%
+            });
+          }
+        );
+      } else {
+        encryptedContent = SecurityService.encryptData(fileContent, fileId);
+      }
+
+      // Update progress: Writing file
+      this.updateOperation(operationId, { progress: 85 });
+
+      // Write encrypted file
+      await FileSystem.writeAsStringAsync(encryptedPath, encryptedContent, {
+        encoding: "utf8" as any,
+      });
+
+      // Generate and store thumbnail if image
+      let encryptedThumbnail: string | undefined;
+      if (fileType.startsWith("image/")) {
+        await this.generateThumbnail(fileContent, fileId, fileType);
+        encryptedThumbnail = 'stored'; // Flag that thumbnail exists
+      }
+
+      // Update progress: Finalizing
+      this.updateOperation(operationId, { progress: 95 });
+
+      const metadata: FileMetadata = {
+        id: fileId,
+        originalName,
+        encryptedPath,
+        fileType,
+        size,
+        encryptedThumbnail,
+        timestamp: Date.now(),
+      };
+
+      // Store metadata
+      SecurityService.storeFileMetadata(metadata);
+
+      // Delete original file if it was copied to cache
+      try {
+        if (sourceUri.includes("cache")) {
+          await FileSystem.deleteAsync(sourceUri, { idempotent: true });
+        }
+      } catch (error) {
+        console.warn("Could not delete cached file:", error);
+      }
+
+      // Complete operation
+      this.updateOperation(operationId, { progress: 100, status: 'completed' });
+      
+      // Show notification
+      await this.showNotification(
+        "File Secured ✓",
+        `${originalName} has been encrypted and stored securely`
+      );
+
+      // Clean up operation after delay
+      setTimeout(() => this.activeOperations.delete(operationId), 3000);
+
+      return metadata;
+    } catch (error) {
+      this.updateOperation(operationId, { 
+        status: 'failed', 
+        error: error instanceof Error ? error.message : 'Unknown error'
+      });
+      
+      await this.showNotification(
+        "Upload Failed ✗",
+        `Failed to secure ${originalName}`
+      );
+      
+      throw error;
+    }
   }
 
-  // Decrypt and read file
-  async readSecureFile(fileId: string): Promise<string | null> {
+  // Generate thumbnail for images (stored separately)
+  private async generateThumbnail(
+    base64Data: string,
+    fileId: string,
+    fileType: string
+  ): Promise<void> {
+    try {
+      // Take first 50KB as thumbnail data (rough compression)
+      const thumbnailData = base64Data.substring(0, 50000);
+      const thumbnailPath = `${this.THUMBNAIL_DIR}${fileId}.thumb`;
+      
+      // Encrypt thumbnail
+      const encryptedThumb = SecurityService.encryptData(thumbnailData, `${fileId}_thumb`);
+      
+      // Store thumbnail
+      await FileSystem.writeAsStringAsync(thumbnailPath, encryptedThumb, {
+        encoding: "utf8" as any,
+      });
+    } catch (error) {
+      console.warn('Failed to generate thumbnail:', error);
+    }
+  }
+
+  // Get thumbnail for file
+  async getThumbnail(fileId: string): Promise<string | null> {
+    try {
+      const thumbnailPath = `${this.THUMBNAIL_DIR}${fileId}.thumb`;
+      const thumbInfo = await FileSystem.getInfoAsync(thumbnailPath);
+      
+      if (!thumbInfo.exists) return null;
+      
+      const encryptedThumb = await FileSystem.readAsStringAsync(thumbnailPath, {
+        encoding: "utf8" as any,
+      });
+      
+      return SecurityService.decryptData(encryptedThumb, `${fileId}_thumb`);
+    } catch (error) {
+      console.warn('Failed to get thumbnail:', error);
+      return null;
+    }
+  }
+
+  // Decrypt and read file (with progress tracking)
+  async readSecureFile(
+    fileId: string,
+    onProgress?: (progress: number) => void
+  ): Promise<string | null> {
     try {
       const metadata = SecurityService.getAllFileMetadata().find(
         (f) => f.id === fileId,
@@ -202,6 +397,8 @@ class FileService {
       if (!metadata) {
         throw new Error("File not found");
       }
+
+      if (onProgress) onProgress(10);
 
       // Read encrypted file
       const encryptedContent = await FileSystem.readAsStringAsync(
@@ -211,11 +408,23 @@ class FileService {
         },
       );
 
-      // Decrypt content
-      const decryptedContent = SecurityService.decryptData(
-        encryptedContent,
-        fileId,
-      );
+      if (onProgress) onProgress(30);
+
+      // Decrypt content with progress for large files
+      let decryptedContent: string;
+      if (encryptedContent.length > 1000000) { // > 1MB
+        decryptedContent = await SecurityService.decryptDataChunked(
+          encryptedContent,
+          fileId,
+          (chunkProgress) => {
+            if (onProgress) onProgress(30 + (chunkProgress * 0.6)); // 30-90%
+          }
+        );
+      } else {
+        decryptedContent = SecurityService.decryptData(encryptedContent, fileId);
+      }
+
+      if (onProgress) onProgress(100);
 
       return decryptedContent;
     } catch (error) {
@@ -272,23 +481,64 @@ class FileService {
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];
   }
-  // Download file to device storage
+  // Download file to device storage (with background processing)
   async downloadFile(
     fileId: string,
-  ): Promise<{ success: boolean; message: string; fileName?: string }> {
+  ): Promise<{ success: boolean; message: string; fileName?: string; operationId?: string }> {
+    const metadata = SecurityService.getAllFileMetadata().find(
+      (f) => f.id === fileId,
+    );
+    if (!metadata) {
+      return { success: false, message: "File not found" };
+    }
+
+    const operationId = `download_${fileId}_${Date.now()}`;
+    
+    // Create operation tracker
+    const operation: FileOperation = {
+      id: operationId,
+      type: 'download',
+      fileName: metadata.originalName,
+      progress: 0,
+      status: 'processing',
+    };
+    this.activeOperations.set(operationId, operation);
+
+    // Run download in background-style async operation
+    this.performDownload(fileId, operationId).catch(error => {
+      console.error('Background download failed:', error);
+    });
+
+    return {
+      success: true,
+      message: `Downloading ${metadata.originalName}...`,
+      fileName: metadata.originalName,
+      operationId,
+    };
+  }
+
+  // Perform download operation (runs in background)
+  private async performDownload(fileId: string, operationId: string): Promise<void> {
     try {
       const metadata = SecurityService.getAllFileMetadata().find(
         (f) => f.id === fileId,
       );
       if (!metadata) {
-        return { success: false, message: "File not found" };
+        throw new Error("File not found");
       }
 
-      // Decrypt the file
-      const decryptedContent = await this.readSecureFile(fileId);
+      // Decrypt the file with progress
+      this.updateOperation(operationId, { progress: 5 });
+      
+      const decryptedContent = await this.readSecureFile(fileId, (progress) => {
+        this.updateOperation(operationId, { progress: 5 + (progress * 0.7) }); // 5-75%
+      });
+      
       if (!decryptedContent) {
-        return { success: false, message: "Failed to decrypt file" };
+        throw new Error("Failed to decrypt file");
       }
+
+      this.updateOperation(operationId, { progress: 80 });
 
       // For images and videos, save to media library
       if (
@@ -298,11 +548,10 @@ class FileService {
         // Request permissions
         const { status } = await MediaLibrary.requestPermissionsAsync();
         if (status !== "granted") {
-          return {
-            success: false,
-            message: "Please grant media library permissions to download files",
-          };
+          throw new Error("Media library permissions not granted");
         }
+
+        this.updateOperation(operationId, { progress: 85 });
 
         // Create temporary file
         const tempPath = `${FileSystem.cacheDirectory}${metadata.originalName}`;
@@ -310,17 +559,20 @@ class FileService {
           encoding: "base64" as any,
         });
 
+        this.updateOperation(operationId, { progress: 92 });
+
         // Save to media library
         await MediaLibrary.createAssetAsync(tempPath);
 
         // Delete temp file
         await FileSystem.deleteAsync(tempPath, { idempotent: true });
 
-        return {
-          success: true,
-          message: `${metadata.originalName} has been saved to your gallery`,
-          fileName: metadata.originalName,
-        };
+        this.updateOperation(operationId, { progress: 100, status: 'completed' });
+        
+        await this.showNotification(
+          "Download Complete ✓",
+          `${metadata.originalName} saved to gallery`
+        );
       } else {
         // For other files, save to Downloads directory
         const downloadPath =
@@ -328,22 +580,53 @@ class FileService {
             ? `${FileSystem.documentDirectory}../Download/${metadata.originalName}`
             : `${FileSystem.documentDirectory}${metadata.originalName}`;
 
+        this.updateOperation(operationId, { progress: 90 });
+
         await FileSystem.writeAsStringAsync(downloadPath, decryptedContent, {
           encoding: "base64" as any,
         });
 
-        return {
-          success: true,
-          message: `${metadata.originalName} has been saved to Downloads`,
-          fileName: metadata.originalName,
-        };
+        this.updateOperation(operationId, { progress: 100, status: 'completed' });
+        
+        await this.showNotification(
+          "Download Complete ✓",
+          `${metadata.originalName} saved to Downloads`
+        );
       }
+
+      // Clean up operation after delay
+      setTimeout(() => this.activeOperations.delete(operationId), 3000);
     } catch (error) {
-      console.error("Download file error:", error);
-      return {
-        success: false,
-        message: "Failed to download file. Please try again.",
-      };
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      this.updateOperation(operationId, { 
+        status: 'failed', 
+        error: errorMsg 
+      });
+      
+      await this.showNotification(
+        "Download Failed ✗",
+        `Failed to download file: ${errorMsg}`
+      );
+    }
+  }
+
+  // Get all active operations
+  getActiveOperations(): FileOperation[] {
+    return Array.from(this.activeOperations.values());
+  }
+
+  // Get specific operation
+  getOperation(operationId: string): FileOperation | undefined {
+    return this.activeOperations.get(operationId);
+  }
+
+  // Cancel operation (if supported)
+  cancelOperation(operationId: string): void {
+    const operation = this.activeOperations.get(operationId);
+    if (operation) {
+      operation.status = 'failed';
+      operation.error = 'Cancelled by user';
+      this.activeOperations.delete(operationId);
     }
   }
 }
