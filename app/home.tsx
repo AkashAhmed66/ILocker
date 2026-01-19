@@ -1,23 +1,24 @@
 import SimpleIcon from "@/components/SimpleIcon";
-import FileService from "@/services/FileService";
+import FileService, { FileOperation } from "@/services/FileService";
 import SecurityService, { FileMetadata } from "@/services/SecurityService";
+import { ResizeMode, Video } from "expo-av";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
-  Alert,
-  FlatList,
-  Image,
-  Modal,
-  RefreshControl,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    Alert,
+    FlatList,
+    Image,
+    Modal,
+    RefreshControl,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -34,11 +35,21 @@ export default function HomeScreen() {
   const [confirmNewPassword, setConfirmNewPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [activeOperations, setActiveOperations] = useState<FileOperation[]>([]);
+  const [previewProgress, setPreviewProgress] = useState(0);
+  const videoRef = useRef<Video>(null);
 
   useEffect(() => {
     // Load files and initialize storage (authentication already verified by _layout.tsx)
     loadFiles();
     FileService.initializeSecureStorage();
+    
+    // Poll for active operations
+    const interval = setInterval(() => {
+      setActiveOperations(FileService.getActiveOperations());
+    }, 500);
+    
+    return () => clearInterval(interval);
   }, []);
 
   const loadFiles = () => {
@@ -54,7 +65,6 @@ export default function HomeScreen() {
 
   const handleAddFile = async (type: "document" | "image" | "camera") => {
     setShowMenu(false);
-    setLoading(true);
     try {
       let results: FileMetadata[] = [];
 
@@ -73,18 +83,12 @@ export default function HomeScreen() {
 
       if (results.length > 0) {
         loadFiles();
-        const message =
-          results.length === 1
-            ? "File encrypted and stored securely"
-            : `${results.length} files encrypted and stored securely`;
-        Alert.alert("Success", message);
+        // Operations will show progress automatically via activeOperations
       }
     } catch (error: any) {
       console.error("Add file error:", error);
       const errorMsg = error?.message || "Failed to add file";
       Alert.alert("Error", errorMsg);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -92,16 +96,40 @@ export default function HomeScreen() {
     setSelectedFile(file);
     setLoading(true);
     setShowFilePreview(true);
+    setPreviewContent(null);
+    setPreviewProgress(0);
 
     try {
-      const content = await FileService.readSecureFile(file.id);
+      // For images, try to load thumbnail first for instant preview
+      if (file.fileType.startsWith("image/") && file.encryptedThumbnail) {
+        const thumbnail = await FileService.getThumbnail(file.id);
+        if (thumbnail) {
+          setPreviewContent(thumbnail);
+          setLoading(false);
+        }
+      }
+
+      // Load full content with progress
+      const content = await FileService.readSecureFile(file.id, (progress) => {
+        setPreviewProgress(progress);
+      });
       setPreviewContent(content);
+      setPreviewProgress(100);
     } catch (error) {
       Alert.alert("Error", "Failed to decrypt file");
       setShowFilePreview(false);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleClosePreview = () => {
+    // Cancel any ongoing decryption
+    setLoading(false);
+    setPreviewProgress(0);
+    setPreviewContent(null);
+    setSelectedFile(null);
+    setShowFilePreview(false);
   };
 
   const handleDeleteFile = (file: FileMetadata) => {
@@ -170,19 +198,17 @@ export default function HomeScreen() {
   };
 
   const handleDownloadFile = async (file: FileMetadata) => {
-    setLoading(true);
     try {
       const result = await FileService.downloadFile(file.id);
       if (result.success) {
-        Alert.alert("Success", result.message);
+        // Download started in background - show toast
+        Alert.alert("Download Started", result.message);
       } else {
         Alert.alert("Error", result.message);
       }
     } catch (error) {
       console.error("Download error:", error);
-      Alert.alert("Error", "Failed to download file");
-    } finally {
-      setLoading(false);
+      Alert.alert("Error", "Failed to start download");
     }
   };
 
@@ -258,6 +284,64 @@ export default function HomeScreen() {
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* Active Operations Progress */}
+        {activeOperations.length > 0 && (
+          <View style={styles.operationsContainer}>
+            {activeOperations.map((op) => (
+              <View key={op.id} style={styles.operationCard}>
+                <View style={styles.operationHeader}>
+                  <SimpleIcon 
+                    name={op.type === 'upload' ? 'cloud-upload-outline' : 'cloud-download-outline'} 
+                    size={20} 
+                    color="#4a90e2" 
+                  />
+                  <Text style={styles.operationName} numberOfLines={1}>
+                    {op.fileName}
+                  </Text>
+                  <Text style={styles.operationPercent}>
+                    {Math.round(op.progress)}%
+                  </Text>
+                  {op.status === 'processing' && (
+                    <TouchableOpacity
+                      style={styles.cancelButton}
+                      onPress={() => {
+                        Alert.alert(
+                          'Cancel Operation',
+                          `Cancel ${op.type === 'upload' ? 'encrypting' : 'downloading'} ${op.fileName}?`,
+                          [
+                            { text: 'No', style: 'cancel' },
+                            { 
+                              text: 'Yes, Cancel', 
+                              style: 'destructive',
+                              onPress: () => FileService.cancelOperation(op.id)
+                            }
+                          ]
+                        );
+                      }}
+                    >
+                      <SimpleIcon name="close-circle" size={20} color="#ff4444" />
+                    </TouchableOpacity>
+                  )}
+                </View>
+                <View style={styles.progressBarBg}>
+                  <View 
+                    style={[
+                      styles.progressBarFill, 
+                      { 
+                        width: `${op.progress}%`,
+                        backgroundColor: op.status === 'failed' ? '#ff4444' : '#4a90e2'
+                      }
+                    ]} 
+                  />
+                </View>
+                {op.status === 'failed' && (
+                  <Text style={styles.operationError}>{op.error}</Text>
+                )}
+              </View>
+            ))}
+          </View>
+        )}
 
         {/* File List */}
         {files.length === 0 ? (
@@ -424,7 +508,7 @@ export default function HomeScreen() {
                     color="#4a90e2"
                   />
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => setShowFilePreview(false)}>
+                <TouchableOpacity onPress={handleClosePreview}>
                   <Text style={styles.closeButton}>✕</Text>
                 </TouchableOpacity>
               </View>
@@ -432,8 +516,51 @@ export default function HomeScreen() {
             <ScrollView style={styles.previewContent}>
               {loading ? (
                 <View style={styles.loadingContainer}>
-                  <ActivityIndicator size="large" color="#4a90e2" />
-                  <Text style={styles.loadingText}>Decrypting...</Text>
+                  {/* Decryption Shield Icon */}
+                  <View style={styles.decryptionIconContainer}>
+                    <View style={styles.iconCircle}>
+                      <SimpleIcon name="shield-checkmark" size={48} color="#4a90e2" />
+                    </View>
+                  </View>
+                  
+                  {/* Status Text */}
+                  <Text style={styles.decryptionTitle}>Decrypting File</Text>
+                  <Text style={styles.decryptionSubtitle}>
+                    Securely unlocking your content...
+                  </Text>
+                  
+                  {/* Progress Percentage */}
+                  <View style={styles.progressPercentContainer}>
+                    <Text style={styles.progressPercentText}>
+                      {Math.round(previewProgress)}
+                    </Text>
+                    <Text style={styles.progressPercentSymbol}>%</Text>
+                  </View>
+                  
+                  {/* Progress Bar */}
+                  {previewProgress > 0 && (
+                    <View style={styles.modernProgressBarContainer}>
+                      <View style={styles.modernProgressBarBg}>
+                        <View 
+                          style={[
+                            styles.modernProgressBarFill, 
+                            { width: `${previewProgress}%` }
+                          ]} 
+                        />
+                      </View>
+                      <Text style={styles.progressStatusText}>
+                        {previewProgress < 30 ? 'Reading encrypted data...' :
+                         previewProgress < 70 ? 'Decrypting content...' :
+                         previewProgress < 95 ? 'Finalizing...' : 'Almost done!'}
+                      </Text>
+                    </View>
+                  )}
+                  
+                  {/* Security Badge */}
+                  <View style={styles.securityBadge}>
+                    <SimpleIcon name="lock-closed" size={14} color="#4a90e2" />
+                    <Text style={styles.securityBadgeText}>AES-256 Encrypted</Text>
+                  </View>
                 </View>
               ) : (
                 <View style={styles.previewContainer}>
@@ -446,11 +573,26 @@ export default function HomeScreen() {
                       style={styles.previewImage}
                       resizeMode="contain"
                     />
+                  ) : selectedFile?.fileType.startsWith("video/") &&
+                  previewContent ? (
+                    <Video
+                      ref={videoRef}
+                      source={{
+                        uri: `data:${selectedFile.fileType};base64,${previewContent}`,
+                      }}
+                      style={styles.previewVideo}
+                      useNativeControls
+                      resizeMode={ResizeMode.CONTAIN}
+                      isLooping
+                      shouldPlay={false}
+                    />
                   ) : (
                     <View style={styles.filePreviewInfo}>
-                      <Text style={styles.previewFileIcon}>
-                        {FileService.getFileIcon(selectedFile?.fileType || "")}
-                      </Text>
+                      <SimpleIcon 
+                        name={FileService.getFileIcon(selectedFile?.fileType || "") as any}
+                        size={80}
+                        color="#4a90e2"
+                      />
                       <Text style={styles.previewFileName}>
                         {selectedFile?.originalName}
                       </Text>
@@ -507,6 +649,56 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: "#888",
     marginTop: 4,
+  },
+  operationsContainer: {
+    paddingHorizontal: 20,
+    paddingBottom: 10,
+  },
+  operationCard: {
+    backgroundColor: "#1a1a2e",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: "#2a2a3e",
+  },
+  operationHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  operationName: {
+    flex: 1,
+    fontSize: 14,
+    color: "#fff",
+    marginLeft: 8,
+  },
+  operationPercent: {
+    fontSize: 12,
+    color: "#4a90e2",
+    fontWeight: "bold",
+  },
+  cancelButton: {
+    marginLeft: 8,
+    padding: 4,
+  },
+  operationError: {
+    fontSize: 12,
+    color: "#ff4444",
+    marginTop: 4,
+  },
+  progressBarBg: {
+    height: 4,
+    backgroundColor: "#2a2a3e",
+    borderRadius: 2,
+    overflow: "hidden",
+    width: "100%",
+    marginTop: 4,
+  },
+  progressBarFill: {
+    height: "100%",
+    backgroundColor: "#4a90e2",
+    borderRadius: 2,
   },
   headerButtons: {
     flexDirection: "row",
@@ -739,6 +931,11 @@ const styles = StyleSheet.create({
     width: "100%",
     height: 600,
   },
+  previewVideo: {
+    width: "100%",
+    height: 600,
+    backgroundColor: "#000",
+  },
   filePreviewInfo: {
     alignItems: "center",
     justifyContent: "center",
@@ -771,6 +968,109 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     paddingTop: 100,
+    paddingHorizontal: 40,
+  },
+  decryptionIconContainer: {
+    position: 'relative',
+    width: 120,
+    height: 120,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 32,
+  },
+  iconCircle: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#16213e',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#4a90e2',
+    shadowColor: '#4a90e2',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 20,
+    elevation: 10,
+  },
+  loadingRing: {
+    position: 'absolute',
+    width: 120,
+    height: 120,
+  },
+  decryptionTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  decryptionSubtitle: {
+    fontSize: 14,
+    color: '#888',
+    marginBottom: 24,
+    textAlign: 'center',
+  },
+  progressPercentContainer: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    marginBottom: 24,
+  },
+  progressPercentText: {
+    fontSize: 56,
+    fontWeight: 'bold',
+    color: '#4a90e2',
+    fontVariant: ['tabular-nums'],
+  },
+  progressPercentSymbol: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#4a90e2',
+    marginLeft: 4,
+  },
+  modernProgressBarContainer: {
+    width: '100%',
+    marginBottom: 32,
+  },
+  modernProgressBarBg: {
+    height: 8,
+    backgroundColor: '#1a1a2e',
+    borderRadius: 4,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  modernProgressBarFill: {
+    height: '100%',
+    backgroundColor: '#4a90e2',
+    borderRadius: 4,
+    shadowColor: '#4a90e2',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.8,
+    shadowRadius: 8,
+  },
+  progressStatusText: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 8,
+    textAlign: 'center',
+    fontStyle: 'italic',
+  },
+  securityBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(74, 144, 226, 0.1)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(74, 144, 226, 0.3)',
+    gap: 6,
+  },
+  securityBadgeText: {
+    fontSize: 12,
+    color: '#4a90e2',
+    fontWeight: '600',
   },
   loadingText: {
     color: "#888",
