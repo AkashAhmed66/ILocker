@@ -17,7 +17,8 @@
         "NSPhotoLibraryUsageDescription": "ILocker needs access to your photo library to encrypt and secure your images",
         "NSPhotoLibraryAddUsageDescription": "ILocker needs permission to save decrypted files to your photo library",
         "UIBackgroundModes": [
-          "fetch"
+          "fetch",
+          "processing"
         ],
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -33,7 +34,10 @@
         "READ_MEDIA_IMAGES",
         "READ_MEDIA_VIDEO",
         "ACCESS_MEDIA_LOCATION",
-        "POST_NOTIFICATIONS"
+        "POST_NOTIFICATIONS",
+        "WAKE_LOCK",
+        "FOREGROUND_SERVICE",
+        "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
       ],
       "allowBackup": false,
       "adaptiveIcon": {

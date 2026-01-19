@@ -4,8 +4,14 @@ import * as ImagePicker from "expo-image-picker";
 import * as MediaLibrary from "expo-media-library";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
+import BackgroundService from "react-native-background-actions";
 import "react-native-get-random-values";
+import BackgroundTaskManager from "./BackgroundTaskManager";
 import SecurityService, { FileMetadata } from "./SecurityService";
+
+// Task names for background operations
+const BACKGROUND_UPLOAD_TASK = "background-upload-task";
+const BACKGROUND_DOWNLOAD_TASK = "background-download-task";
 
 // Configure notifications
 Notifications.setNotificationHandler({
@@ -15,8 +21,22 @@ Notifications.setNotificationHandler({
     shouldSetBadge: false,
     shouldShowBanner: true,
     shouldShowList: true,
+    priority: Notifications.AndroidNotificationPriority.MAX,
   }),
 });
+
+// Set up notification channel for Android
+if (Platform.OS === 'android') {
+  Notifications.setNotificationChannelAsync('file-operations', {
+    name: 'File Operations',
+    importance: Notifications.AndroidImportance.HIGH,
+    vibrationPattern: [0, 250, 250, 250],
+    lightColor: '#4a90e2',
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+    bypassDnd: false,
+    showBadge: true,
+  });
+}
 
 export interface FileOperation {
   id: string;
@@ -32,6 +52,12 @@ class FileService {
   private readonly THUMBNAIL_DIR = `${FileSystem.documentDirectory || "file:///"}thumbnails/`;
   private activeOperations: Map<string, FileOperation> = new Map();
   private operationListeners: Map<string, (op: FileOperation) => void> = new Map();
+  private backgroundNotificationIds: Map<string, string> = new Map();
+  private keepAliveTimers: Map<string, NodeJS.Timeout> = new Map();
+  private lastNotificationUpdate: Map<string, number> = new Map();
+  private readonly NOTIFICATION_UPDATE_THROTTLE = 2000; // Update notification max every 2 seconds
+  private backgroundServiceRunning = false;
+  private activeBackgroundOperations = 0;
 
   // Initialize secure directory
   async initializeSecureStorage(): Promise<void> {
@@ -61,6 +87,9 @@ class FileService {
 
       // Request notification permissions
       await this.requestNotificationPermissions();
+      
+      // Register background task
+      await BackgroundTaskManager.registerBackgroundTask();
     } catch (error) {
       console.warn("Failed to initialize secure storage:", error);
     }
@@ -96,10 +125,201 @@ class FileService {
     const operation = this.activeOperations.get(operationId);
     if (operation) {
       Object.assign(operation, updates);
+      
+      // Background service notification will show progress automatically
+      // this.updatePersistentNotification(operationId, operation);
+      
       const listener = this.operationListeners.get(operationId);
       if (listener) {
         listener(operation);
       }
+    }
+  }
+
+  // Create persistent notification for background operation
+  private async createPersistentNotification(
+    operationId: string,
+    operation: FileOperation
+  ): Promise<void> {
+    try {
+      const identifier = `file-operation-${operationId}`;
+      
+      await Notifications.scheduleNotificationAsync({
+        identifier,
+        content: {
+          title: operation.type === 'upload' ? '🔒 Encrypting File' : '🔓 Decrypting File',
+          body: operation.fileName,
+          sound: false,
+          sticky: true,
+          priority: Notifications.AndroidNotificationPriority.MAX,
+          data: { operationId, progress: 0 },
+          ...(Platform.OS === 'android' && {
+            categoryIdentifier: 'file-operations',
+          }),
+        },
+        trigger: null,
+      });
+      
+      this.backgroundNotificationIds.set(operationId, identifier);
+      this.lastNotificationUpdate.set(operationId, Date.now());
+    } catch (error) {
+      console.warn('Failed to create persistent notification:', error);
+    }
+  }
+
+  // Update persistent notification with progress (throttled)
+  private async updatePersistentNotification(
+    operationId: string,
+    operation: FileOperation
+  ): Promise<void> {
+    try {
+      const identifier = this.backgroundNotificationIds.get(operationId);
+      if (!identifier || operation.status !== 'processing') return;
+      
+      // Throttle updates - only update if enough time has passed
+      const lastUpdate = this.lastNotificationUpdate.get(operationId) || 0;
+      const now = Date.now();
+      const timeSinceLastUpdate = now - lastUpdate;
+      
+      // Only update if 2 seconds have passed OR progress is at key milestones
+      const isKeyMilestone = operation.progress % 25 === 0 || operation.progress >= 95;
+      if (timeSinceLastUpdate < this.NOTIFICATION_UPDATE_THROTTLE && !isKeyMilestone) {
+        return;
+      }
+      
+      this.lastNotificationUpdate.set(operationId, now);
+      
+      // Update the same notification in place
+      await Notifications.scheduleNotificationAsync({
+        identifier, // Reuse same identifier to update in place
+        content: {
+          title: operation.type === 'upload' ? '🔒 Encrypting File' : '🔓     File',
+          body: `${operation.fileName} - ${Math.round(operation.progress)}%`,
+          sound: false,
+          sticky: true,
+          priority: Notifications.AndroidNotificationPriority.MAX,
+          data: { operationId, progress: operation.progress },
+          ...(Platform.OS === 'android' && {
+            categoryIdentifier: 'file-operations',
+          }),
+        },
+        trigger: null,
+      });
+    } catch (error) {
+      console.warn('Failed to update persistent notification:', error);
+    }
+  }
+
+  // Remove persistent notification
+  private async removePersistentNotification(operationId: string): Promise<void> {
+    try {
+      const identifier = this.backgroundNotificationIds.get(operationId);
+      if (identifier) {
+        await Notifications.dismissNotificationAsync(identifier);
+        this.backgroundNotificationIds.delete(operationId);
+        this.lastNotificationUpdate.delete(operationId);
+      }
+    } catch (error) {
+      console.warn('Failed to remove persistent notification:', error);
+    }
+  }
+
+  // Start background service to keep operations running
+  private async startBackgroundService(): Promise<void> {
+    if (this.backgroundServiceRunning) {
+      return;
+    }
+
+    try {
+      const options = {
+        taskName: 'ILocker File Processing',
+        taskTitle: 'Processing Files',
+        taskDesc: 'Encrypting or decrypting your files securely',
+        taskIcon: {
+          name: 'ic_launcher',
+          type: 'mipmap',
+        },
+        color: '#4a90e2',
+        linkingURI: 'ilocker://',
+        progressBar: {
+          max: 100,
+          value: 0,
+          indeterminate: false,
+        },
+        parameters: {
+          delay: 1000,
+        },
+      };
+
+      await BackgroundService.start(this.backgroundTask, options);
+      this.backgroundServiceRunning = true;
+      console.log('[BackgroundService] Started');
+    } catch (error) {
+      console.warn('[BackgroundService] Failed to start:', error);
+    }
+  }
+
+  // Background task that keeps running
+  private backgroundTask = async (taskData: any) => {
+    await new Promise(async (resolve) => {
+      // Keep running while there are active operations
+      while (this.activeBackgroundOperations > 0) {
+        const operations = Array.from(this.activeOperations.values());
+        const processingOps = operations.filter(op => op.status === 'processing');
+        
+        let taskTitle = 'Processing';
+        let taskDesc = '';
+        
+        if (processingOps.length === 1) {
+          const op = processingOps[0];
+          const action = op.type === 'upload' ? 'Encrypting' : 'Decrypting';
+          const percentage = Math.round(op.progress);
+          taskTitle = `${percentage}% ${action}`;
+          taskDesc = op.fileName;
+        } else if (processingOps.length > 1) {
+          const percentage = Math.round(this.getAverageProgress());
+          taskTitle = `${percentage}% Processing`;
+          taskDesc = `${processingOps.length} files`;
+        }
+        
+        await BackgroundService.updateNotification({
+          taskTitle,
+          taskDesc,
+          progressBar: {
+            max: 100,
+            value: this.getAverageProgress(),
+            indeterminate: false,
+          },
+        });
+        
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      resolve(undefined);
+    });
+  };
+
+  // Get average progress of all operations
+  private getAverageProgress(): number {
+    const operations = Array.from(this.activeOperations.values());
+    if (operations.length === 0) return 0;
+    
+    const total = operations.reduce((sum, op) => sum + op.progress, 0);
+    return Math.round(total / operations.length);
+  }
+
+  // Stop background service
+  private async stopBackgroundService(): Promise<void> {
+    if (!this.backgroundServiceRunning) {
+      return;
+    }
+
+    try {
+      await BackgroundService.stop();
+      this.backgroundServiceRunning = false;
+      console.log('[BackgroundService] Stopped');
+    } catch (error) {
+      console.warn('[BackgroundService] Failed to stop:', error);
     }
   }
 
@@ -245,6 +465,11 @@ class FileService {
       status: 'processing',
     };
     this.activeOperations.set(operationId, operation);
+    
+    // Start background service (will show progress notification)
+    // await this.createPersistentNotification(operationId, operation);
+    this.activeBackgroundOperations++;
+    await this.startBackgroundService();
 
     try {
       const encryptedFileName = `${fileId}.enc`;
@@ -320,7 +545,14 @@ class FileService {
       // Complete operation
       this.updateOperation(operationId, { progress: 100, status: 'completed' });
       
-      // Show notification
+      // Stop background service if no more operations
+      // await this.removePersistentNotification(operationId);
+      this.activeBackgroundOperations--;
+      if (this.activeBackgroundOperations === 0) {
+        await this.stopBackgroundService();
+      }
+      
+      // Show completion notification
       await this.showNotification(
         "File Secured ✓",
         `${originalName} has been encrypted and stored securely`
@@ -335,6 +567,13 @@ class FileService {
         status: 'failed', 
         error: error instanceof Error ? error.message : 'Unknown error'
       });
+      
+      // Stop background service if no more operations
+      // await this.removePersistentNotification(operationId);
+      this.activeBackgroundOperations--;
+      if (this.activeBackgroundOperations === 0) {
+        await this.stopBackgroundService();
+      }
       
       await this.showNotification(
         "Upload Failed ✗",
@@ -505,6 +744,11 @@ class FileService {
       status: 'processing',
     };
     this.activeOperations.set(operationId, operation);
+    
+    // Start background service (will show progress notification)
+    // await this.createPersistentNotification(operationId, operation);
+    this.activeBackgroundOperations++;
+    await this.startBackgroundService();
 
     // Run download in background-style async operation
     this.performDownload(fileId, operationId).catch(error => {
@@ -571,6 +815,13 @@ class FileService {
 
         this.updateOperation(operationId, { progress: 100, status: 'completed' });
         
+        // Stop background service if no more operations
+        // await this.removePersistentNotification(operationId);
+        this.activeBackgroundOperations--;
+        if (this.activeBackgroundOperations === 0) {
+          await this.stopBackgroundService();
+        }
+        
         await this.showNotification(
           "Download Complete ✓",
           `${metadata.originalName} saved to gallery`
@@ -590,6 +841,13 @@ class FileService {
 
         this.updateOperation(operationId, { progress: 100, status: 'completed' });
         
+        // Stop background service if no more operations
+        // await this.removePersistentNotification(operationId);
+        this.activeBackgroundOperations--;
+        if (this.activeBackgroundOperations === 0) {
+          await this.stopBackgroundService();
+        }
+        
         await this.showNotification(
           "Download Complete ✓",
           `${metadata.originalName} saved to Downloads`
@@ -604,6 +862,13 @@ class FileService {
         status: 'failed', 
         error: errorMsg 
       });
+      
+      // Stop background service if no more operations
+      // await this.removePersistentNotification(operationId);
+      this.activeBackgroundOperations--;
+      if (this.activeBackgroundOperations === 0) {
+        await this.stopBackgroundService();
+      }
       
       await this.showNotification(
         "Download Failed ✗",
