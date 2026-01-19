@@ -12,7 +12,7 @@ try {
   MMKV = require('react-native-mmkv').MMKV;
   storage = new MMKV({
     id: 'ilocker-secure-storage',
-    encryptionKey: 'ilocker-encryption-key-2026',
+    encryptionKey: 'SD*k3kGhSgfSgli@hkf#fg£gk&w',
   });
   console.log('Using MMKV for storage');
 } catch (error) {
