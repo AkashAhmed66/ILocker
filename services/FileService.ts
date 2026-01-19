@@ -58,6 +58,7 @@ class FileService {
   private readonly NOTIFICATION_UPDATE_THROTTLE = 2000; // Update notification max every 2 seconds
   private backgroundServiceRunning = false;
   private activeBackgroundOperations = 0;
+  private cancelledOperations: Set<string> = new Set();
 
   // Initialize secure directory
   async initializeSecureStorage(): Promise<void> {
@@ -476,45 +477,109 @@ class FileService {
       const encryptedPath = `${this.SECURE_DIR}${encryptedFileName}`;
 
       // Update progress: Reading file
-      this.updateOperation(operationId, { progress: 10 });
+      this.updateOperation(operationId, { progress: 5 });
+      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
 
-      // Read file content
-      const fileContent = await FileSystem.readAsStringAsync(sourceUri, {
-        encoding: "base64" as any,
-      });
+      // Check file size - if > 500MB, reject it to prevent OOM
+      // Note: Actual limit depends on device memory (base64 inflates size by ~33%)
+      if (size > 100 * 1024 * 1024) {
+        const sizeMB = Math.round(size / (1024 * 1024));
+        throw new Error(`File too large (${sizeMB}MB). Maximum size is 100MB.`);
+      }
 
-      // Update progress: Encrypting
-      this.updateOperation(operationId, { progress: 30 });
+      // Warn for files > 50MB
+      if (size > 50 * 1024 * 1024) {
+        console.warn(`Large file detected: ${Math.round(size / (1024 * 1024))}MB - may cause memory issues`);
+      }
 
-      // Encrypt file content with progress (use chunked for large files)
+      // For large files (> 10MB), read and process in chunks to avoid OOM
+      let fileContent: string;
       let encryptedContent: string;
-      if (fileContent.length > 1000000) { // > 1MB use chunked
-        encryptedContent = await SecurityService.encryptDataChunked(
-          fileContent,
-          fileId,
-          (chunkProgress) => {
-            this.updateOperation(operationId, { 
-              progress: 30 + (chunkProgress * 0.5) // 30-80%
-            });
+      
+      if (size > 10 * 1024 * 1024) {
+        // Large file: Read in smaller base64 chunks
+        this.updateOperation(operationId, { progress: 10 });
+        
+        try {
+          // Read entire file (will use native memory more efficiently)
+          fileContent = await FileSystem.readAsStringAsync(sourceUri, {
+            encoding: "base64" as any,
+          });
+          
+          this.updateOperation(operationId, { progress: 25 });
+          if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
+          
+          // Process in chunks
+          encryptedContent = await SecurityService.encryptDataChunked(
+            fileContent,
+            fileId,
+            (chunkProgress) => {
+              if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
+              this.updateOperation(operationId, { 
+                progress: 25 + (chunkProgress * 0.6) // 25-85%
+              });
+            }
+          );
+          
+          // Clear fileContent from memory
+          fileContent = '';
+        } catch (error: any) {
+          if (error.message?.includes('OutOfMemoryError') || error.message?.includes('allocation')) {
+            const sizeMB = Math.round(size / (1024 * 1024));
+            throw new Error(`File too large (${sizeMB}MB). Your device doesn't have enough memory. Try a file under ${Math.max(20, Math.floor(sizeMB * 0.5))}MB.`);
           }
-        );
+          throw error;
+        }
       } else {
-        encryptedContent = SecurityService.encryptData(fileContent, fileId);
+        // Small file: Normal processing
+        this.updateOperation(operationId, { progress: 15 });
+        
+        fileContent = await FileSystem.readAsStringAsync(sourceUri, {
+          encoding: "base64" as any,
+        });
+
+        this.updateOperation(operationId, { progress: 40 });
+        if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
+
+        // Encrypt with or without chunking based on size
+        if (fileContent.length > 1000000) {
+          encryptedContent = await SecurityService.encryptDataChunked(
+            fileContent,
+            fileId,
+            (chunkProgress) => {
+              if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
+              this.updateOperation(operationId, { 
+                progress: 40 + (chunkProgress * 0.45) // 40-85%
+              });
+            }
+          );
+        } else {
+          encryptedContent = SecurityService.encryptData(fileContent, fileId);
+        }
       }
 
       // Update progress: Writing file
-      this.updateOperation(operationId, { progress: 85 });
+      this.updateOperation(operationId, { progress: 88 });
+      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
 
       // Write encrypted file
       await FileSystem.writeAsStringAsync(encryptedPath, encryptedContent, {
         encoding: "utf8" as any,
       });
 
-      // Generate and store thumbnail if image
+      // Generate and store thumbnail if image (read again for thumbnail if needed)
       let encryptedThumbnail: string | undefined;
-      if (fileType.startsWith("image/")) {
-        await this.generateThumbnail(fileContent, fileId, fileType);
-        encryptedThumbnail = 'stored'; // Flag that thumbnail exists
+      if (fileType.startsWith("image/") && size < 10 * 1024 * 1024) {
+        // Only generate thumbnails for images < 10MB
+        try {
+          const thumbData = await FileSystem.readAsStringAsync(sourceUri, {
+            encoding: "base64" as any,
+          });
+          await this.generateThumbnail(thumbData, fileId, fileType);
+          encryptedThumbnail = 'stored';
+        } catch (error) {
+          console.warn('Failed to generate thumbnail:', error);
+        }
       }
 
       // Update progress: Finalizing
@@ -775,8 +840,10 @@ class FileService {
 
       // Decrypt the file with progress
       this.updateOperation(operationId, { progress: 5 });
+      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
       
       const decryptedContent = await this.readSecureFile(fileId, (progress) => {
+        if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
         this.updateOperation(operationId, { progress: 5 + (progress * 0.7) }); // 5-75%
       });
       
@@ -785,6 +852,7 @@ class FileService {
       }
 
       this.updateOperation(operationId, { progress: 80 });
+      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
 
       // For images and videos, save to media library
       if (
@@ -887,13 +955,37 @@ class FileService {
     return this.activeOperations.get(operationId);
   }
 
-  // Cancel operation (if supported)
-  cancelOperation(operationId: string): void {
+  // Check if operation is cancelled
+  private isCancelled(operationId: string): boolean {
+    return this.cancelledOperations.has(operationId);
+  }
+
+  // Cancel operation
+  async cancelOperation(operationId: string): Promise<void> {
     const operation = this.activeOperations.get(operationId);
-    if (operation) {
+    if (operation && operation.status === 'processing') {
+      // Mark as cancelled
+      this.cancelledOperations.add(operationId);
       operation.status = 'failed';
       operation.error = 'Cancelled by user';
-      this.activeOperations.delete(operationId);
+      
+      // Decrement background operations counter
+      this.activeBackgroundOperations--;
+      if (this.activeBackgroundOperations === 0) {
+        await this.stopBackgroundService();
+      }
+      
+      // Show cancellation notification
+      await this.showNotification(
+        "Operation Cancelled",
+        `${operation.fileName} has been cancelled`
+      );
+      
+      // Clean up after delay
+      setTimeout(() => {
+        this.activeOperations.delete(operationId);
+        this.cancelledOperations.delete(operationId);
+      }, 2000);
     }
   }
 }

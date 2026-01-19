@@ -302,6 +302,27 @@ export default function HomeScreen() {
                   <Text style={styles.operationPercent}>
                     {Math.round(op.progress)}%
                   </Text>
+                  {op.status === 'processing' && (
+                    <TouchableOpacity
+                      style={styles.cancelButton}
+                      onPress={() => {
+                        Alert.alert(
+                          'Cancel Operation',
+                          `Cancel ${op.type === 'upload' ? 'encrypting' : 'downloading'} ${op.fileName}?`,
+                          [
+                            { text: 'No', style: 'cancel' },
+                            { 
+                              text: 'Yes, Cancel', 
+                              style: 'destructive',
+                              onPress: () => FileService.cancelOperation(op.id)
+                            }
+                          ]
+                        );
+                      }}
+                    >
+                      <SimpleIcon name="close-circle" size={20} color="#ff4444" />
+                    </TouchableOpacity>
+                  )}
                 </View>
                 <View style={styles.progressBarBg}>
                   <View 
@@ -656,6 +677,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#4a90e2",
     fontWeight: "bold",
+  },
+  cancelButton: {
+    marginLeft: 8,
+    padding: 4,
   },
   operationError: {
     fontSize: 12,
