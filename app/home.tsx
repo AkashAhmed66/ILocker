@@ -24,7 +24,13 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function HomeScreen() {
   const router = useRouter();
-  const [files, setFiles] = useState<FileMetadata[]>([]);
+  const [allFiles, setAllFiles] = useState<FileMetadata[]>([]); // All loaded files
+  const [displayedFiles, setDisplayedFiles] = useState<FileMetadata[]>([]); // Filtered & Paginated
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeFilter, setActiveFilter] = useState<"All" | "Images" | "Videos" | "Documents">("All");
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 20;
+
   const [showMenu, setShowMenu] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showFilePreview, setShowFilePreview] = useState(false);
@@ -52,9 +58,65 @@ export default function HomeScreen() {
     return () => clearInterval(interval);
   }, []);
 
+  // Filter & Search Logic
+  useEffect(() => {
+    let result = allFiles;
+
+    // 1. Filter by Category
+    if (activeFilter !== "All") {
+      result = result.filter(file => {
+        if (activeFilter === "Images") return file.fileType.startsWith("image/");
+        if (activeFilter === "Videos") return file.fileType.startsWith("video/");
+        if (activeFilter === "Documents") return !file.fileType.startsWith("image/") && !file.fileType.startsWith("video/");
+        return true;
+      });
+    }
+
+    // 2. Filter by Search
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase();
+      result = result.filter(file =>
+        file.originalName.toLowerCase().includes(query)
+      );
+    }
+
+    // 3. Reset Pagination on Filter Change
+    setPage(1);
+    setDisplayedFiles(result.slice(0, PAGE_SIZE));
+  }, [allFiles, activeFilter, searchQuery]);
+
+  // Load More (Infinite Scroll)
+  const loadMoreFiles = () => {
+    if (displayedFiles.length >= allFiles.length) return; // All loaded (approximation)
+
+    // Re-run filter to get full filtered list source (inefficient but safe for now)
+    let filteredList = allFiles;
+    if (activeFilter !== "All") {
+      filteredList = filteredList.filter(file => {
+        if (activeFilter === "Images") return file.fileType.startsWith("image/");
+        if (activeFilter === "Videos") return file.fileType.startsWith("video/");
+        if (activeFilter === "Documents") return !file.fileType.startsWith("image/") && !file.fileType.startsWith("video/");
+        return true;
+      });
+    }
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase();
+      filteredList = filteredList.filter(file => file.originalName.toLowerCase().includes(query));
+    }
+
+    if (displayedFiles.length >= filteredList.length) return;
+
+    const nextPage = page + 1;
+    const nextBatch = filteredList.slice(0, nextPage * PAGE_SIZE);
+    setDisplayedFiles(nextBatch);
+    setPage(nextPage);
+  };
+
   const loadFiles = () => {
-    const allFiles = SecurityService.getAllFileMetadata();
-    setFiles(allFiles.sort((a, b) => b.timestamp - a.timestamp));
+    const files = SecurityService.getAllFileMetadata();
+    const sorted = files.sort((a, b) => b.timestamp - a.timestamp);
+    setAllFiles(sorted);
+    // Initial display handled by useEffect
   };
 
   const onRefresh = useCallback(() => {
@@ -76,9 +138,9 @@ export default function HomeScreen() {
           results = await FileService.pickImage();
           break;
         case "camera":
-          const singleResult = await FileService.takePhoto();
-          if (singleResult) results = [singleResult];
-          break;
+          // Open Custom Camera Screen
+          router.push("/camera");
+          return; // Early return, file added via Camera screen logic updates
       }
 
       if (results.length > 0) {
@@ -257,6 +319,17 @@ export default function HomeScreen() {
     </TouchableOpacity>
   );
 
+  const FilterPill = ({ label, value }: { label: string, value: typeof activeFilter }) => (
+    <TouchableOpacity
+      style={[styles.filterPill, activeFilter === value && styles.activeFilterPill]}
+      onPress={() => setActiveFilter(value)}
+    >
+      <Text style={[styles.filterPillText, activeFilter === value && styles.activeFilterPillText]}>
+        {label}
+      </Text>
+    </TouchableOpacity>
+  );
+
   return (
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <StatusBar style="light" />
@@ -268,7 +341,7 @@ export default function HomeScreen() {
             <View>
               <Text style={styles.headerTitle}>ILocker</Text>
               <Text style={styles.headerSubtitle}>
-                {files.length} secure files
+                {allFiles.length} secure files
               </Text>
             </View>
           </View>
@@ -283,6 +356,31 @@ export default function HomeScreen() {
               <SimpleIcon name="lock-closed-outline" size={24} color="#fff" />
             </TouchableOpacity>
           </View>
+        </View>
+
+        {/* Search & Filter Section */}
+        <View style={styles.searchSection}>
+          <View style={styles.searchBar}>
+            <SimpleIcon name="search" size={20} color="#666" />
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search files..."
+              placeholderTextColor="#666"
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+            />
+            {searchQuery.length > 0 && (
+              <TouchableOpacity onPress={() => setSearchQuery("")}>
+                <SimpleIcon name="close-circle" size={18} color="#666" />
+              </TouchableOpacity>
+            )}
+          </View>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterContainer}>
+            <FilterPill label="All" value="All" />
+            <FilterPill label="Images" value="Images" />
+            <FilterPill label="Videos" value="Videos" />
+            <FilterPill label="Documents" value="Documents" />
+          </ScrollView>
         </View>
 
         {/* Active Operations Progress */}
@@ -344,7 +442,7 @@ export default function HomeScreen() {
         )}
 
         {/* File List */}
-        {files.length === 0 ? (
+        {allFiles.length === 0 ? (
           <View style={styles.emptyState}>
             <SimpleIcon name="folder-open-outline" size={64} color="#666" />
             <Text style={styles.emptyTitle}>No Files Yet</Text>
@@ -354,16 +452,23 @@ export default function HomeScreen() {
           </View>
         ) : (
           <FlatList
-            data={files}
+            data={displayedFiles}
             renderItem={renderFileItem}
             keyExtractor={(item) => item.id}
             contentContainerStyle={styles.fileList}
+            onEndReached={loadMoreFiles}
+            onEndReachedThreshold={0.5}
             refreshControl={
               <RefreshControl
                 refreshing={refreshing}
                 onRefresh={onRefresh}
                 tintColor="#4a90e2"
               />
+            }
+            ListEmptyComponent={
+              <View style={[styles.emptyState, { marginTop: 40 }]}>
+                <Text style={{ color: '#666' }}>No results found</Text>
+              </View>
             }
           />
         )}
@@ -400,7 +505,7 @@ export default function HomeScreen() {
                 onPress={() => handleAddFile("camera")}
               >
                 <SimpleIcon name="camera-outline" size={24} color="#4a90e2" />
-                <Text style={styles.menuText}>Take Photo</Text>
+                <Text style={styles.menuText}>Camera</Text>
               </TouchableOpacity>
             </View>
           </TouchableOpacity>
@@ -1094,5 +1199,50 @@ const styles = StyleSheet.create({
     alignItems: "center",
     borderWidth: 1,
     borderColor: "#2a2a3e",
+  },
+  searchSection: {
+    paddingHorizontal: 20,
+    paddingBottom: 12,
+  },
+  searchBar: {
+    flexDirection: "row",
+    alignItems: 'center',
+    backgroundColor: "#1a1a2e",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#2a2a3e",
+  },
+  searchInput: {
+    flex: 1,
+    color: "#fff",
+    fontSize: 16,
+    marginLeft: 8,
+  },
+  filterContainer: {
+    flexDirection: 'row',
+  },
+  filterPill: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: "#1a1a2e",
+    borderWidth: 1,
+    borderColor: "#2a2a3e",
+    marginRight: 8,
+  },
+  activeFilterPill: {
+    backgroundColor: "#4a90e2",
+    borderColor: "#4a90e2",
+  },
+  filterPillText: {
+    color: "#888",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  activeFilterPillText: {
+    color: "#fff",
   },
 });

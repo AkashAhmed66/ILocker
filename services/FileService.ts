@@ -260,7 +260,7 @@ class FileService {
   }
 
   // Core Encryption Logic (Streamed)
-  private async secureFile(sourceUri: string, originalName: string, fileType: string, size: number): Promise<FileMetadata> {
+  public async secureFile(sourceUri: string, originalName: string, fileType: string, size: number): Promise<FileMetadata> {
     await this.initializeSecureStorage();
     const fileId = this.generateFileId();
     const operationId = fileId;
