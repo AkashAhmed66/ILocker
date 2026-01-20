@@ -43,7 +43,61 @@ export default function HomeScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [activeOperations, setActiveOperations] = useState<FileOperation[]>([]);
   const [previewProgress, setPreviewProgress] = useState(0);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const isSelectionMode = selectedIds.size > 0;
   const videoRef = useRef<Video>(null);
+
+  const toggleSelection = (id: string) => {
+    const newSet = new Set(selectedIds);
+    if (newSet.has(id)) {
+      newSet.delete(id);
+    } else {
+      newSet.add(id);
+    }
+    setSelectedIds(newSet);
+  };
+
+  const cancelSelection = () => {
+    setSelectedIds(new Set());
+  };
+
+  const handleBulkDownload = async () => {
+    const ids = Array.from(selectedIds);
+    cancelSelection();
+    Alert.alert("Bulk Download", `Starting download for ${ids.length} files...`);
+
+    // Process sequentially to avoid overwhelming device/connection
+    for (const id of ids) {
+      await FileService.downloadFile(id);
+      // Small delay to allow UI updates
+      await new Promise(r => setTimeout(r, 500));
+    }
+  };
+
+  const handleBulkDelete = () => {
+    Alert.alert("Bulk Delete", `Delete ${selectedIds.size} files? This cannot be undone.`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete All",
+        style: "destructive",
+        onPress: async () => {
+          const ids = Array.from(selectedIds);
+          setLoading(true);
+          try {
+            for (const id of ids) {
+              await FileService.deleteSecureFile(id);
+            }
+            loadFiles();
+            cancelSelection();
+          } catch (e) {
+            Alert.alert("Error", "Failed to delete some files");
+          } finally {
+            setLoading(false);
+          }
+        }
+      }
+    ]);
+  };
 
   useEffect(() => {
     // Load files and initialize storage (authentication already verified by _layout.tsx)
@@ -155,6 +209,11 @@ export default function HomeScreen() {
   };
 
   const handleFilePress = async (file: FileMetadata) => {
+    if (isSelectionMode) {
+      toggleSelection(file.id);
+      return;
+    }
+
     setSelectedFile(file);
     setLoading(true);
     setShowFilePreview(true);
@@ -274,50 +333,63 @@ export default function HomeScreen() {
     }
   };
 
-  const renderFileItem = ({ item }: { item: FileMetadata }) => (
-    <TouchableOpacity
-      style={styles.fileCard}
-      onPress={() => handleFilePress(item)}
-      onLongPress={() => handleDeleteFile(item)}
-    >
-      <View style={styles.fileIconContainer}>
-        <SimpleIcon
-          name={FileService.getFileIcon(item.fileType) as any}
-          size={32}
-          color="#4a90e2"
-        />
-      </View>
-      <View style={styles.fileInfo}>
-        <Text style={styles.fileName} numberOfLines={1}>
-          {item.originalName}
-        </Text>
-        <Text style={styles.fileDetails}>
-          {FileService.formatFileSize(item.size)} •{" "}
-          {new Date(item.timestamp).toLocaleDateString()}
-        </Text>
-      </View>
-      <View style={styles.fileActions}>
-        <TouchableOpacity
-          style={styles.actionButton}
-          onPress={(e) => {
-            e.stopPropagation();
-            handleDownloadFile(item);
-          }}
-        >
-          <SimpleIcon name="download-outline" size={20} color="#4a90e2" />
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.actionButton}
-          onPress={(e) => {
-            e.stopPropagation();
-            handleDeleteFile(item);
-          }}
-        >
-          <SimpleIcon name="trash-outline" size={20} color="#ff4444" />
-        </TouchableOpacity>
-      </View>
-    </TouchableOpacity>
-  );
+  const renderFileItem = ({ item }: { item: FileMetadata }) => {
+    const isSelected = selectedIds.has(item.id);
+    return (
+      <TouchableOpacity
+        style={[
+          styles.fileCard,
+          isSelected && styles.selectedFileCard
+        ]}
+        onPress={() => handleFilePress(item)}
+        onLongPress={() => toggleSelection(item.id)}
+        delayLongPress={300}
+      >
+        <View style={styles.fileIconContainer}>
+          {isSelected ? (
+            <SimpleIcon name="checkmark-circle" size={32} color="#4a90e2" />
+          ) : (
+            <SimpleIcon
+              name={FileService.getFileIcon(item.fileType) as any}
+              size={32}
+              color="#4a90e2"
+            />
+          )}
+        </View>
+        <View style={styles.fileInfo}>
+          <Text style={styles.fileName} numberOfLines={1}>
+            {item.originalName}
+          </Text>
+          <Text style={styles.fileDetails}>
+            {FileService.formatFileSize(item.size)} •{" "}
+            {new Date(item.timestamp).toLocaleDateString()}
+          </Text>
+        </View>
+        {!isSelectionMode && (
+          <View style={styles.fileActions}>
+            <TouchableOpacity
+              style={styles.actionButton}
+              onPress={(e) => {
+                e.stopPropagation();
+                handleDownloadFile(item);
+              }}
+            >
+              <SimpleIcon name="download-outline" size={20} color="#4a90e2" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.actionButton}
+              onPress={(e) => {
+                e.stopPropagation();
+                handleDeleteFile(item);
+              }}
+            >
+              <SimpleIcon name="trash-outline" size={20} color="#ff4444" />
+            </TouchableOpacity>
+          </View>
+        )}
+      </TouchableOpacity>
+    );
+  };
 
   const FilterPill = ({ label, value }: { label: string, value: typeof activeFilter }) => (
     <TouchableOpacity
@@ -334,29 +406,48 @@ export default function HomeScreen() {
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <StatusBar style="light" />
       <LinearGradient colors={["#0f0f0f", "#1a1a2e"]} style={styles.gradient}>
-        {/* Header */}
-        <View style={styles.header}>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
-            <SimpleIcon name="lock-closed" size={28} color="#4a90e2" />
-            <View>
-              <Text style={styles.headerTitle}>ILocker</Text>
-              <Text style={styles.headerSubtitle}>
-                {allFiles.length} secure files
-              </Text>
+        {/* Header (Normal vs Selection) */}
+        {isSelectionMode ? (
+          <View style={styles.selectionHeader}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+              <TouchableOpacity onPress={cancelSelection}>
+                <SimpleIcon name="close" size={24} color="#fff" />
+              </TouchableOpacity>
+              <Text style={styles.selectionTitle}>{selectedIds.size} Selected</Text>
+            </View>
+            <View style={styles.selectionActions}>
+              <TouchableOpacity onPress={handleBulkDownload}>
+                <SimpleIcon name="download-outline" size={24} color="#4a90e2" />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={handleBulkDelete}>
+                <SimpleIcon name="trash-outline" size={24} color="#ff4444" />
+              </TouchableOpacity>
             </View>
           </View>
-          <View style={styles.headerButtons}>
-            <TouchableOpacity
-              style={styles.iconButton}
-              onPress={() => setShowSettings(true)}
-            >
-              <SimpleIcon name="settings-outline" size={24} color="#fff" />
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.iconButton} onPress={handleLock}>
-              <SimpleIcon name="lock-closed-outline" size={24} color="#fff" />
-            </TouchableOpacity>
+        ) : (
+          <View style={styles.header}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+              <SimpleIcon name="lock-closed" size={28} color="#4a90e2" />
+              <View>
+                <Text style={styles.headerTitle}>ILocker</Text>
+                <Text style={styles.headerSubtitle}>
+                  {allFiles.length} secure files
+                </Text>
+              </View>
+            </View>
+            <View style={styles.headerButtons}>
+              <TouchableOpacity
+                style={styles.iconButton}
+                onPress={() => setShowSettings(true)}
+              >
+                <SimpleIcon name="settings-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.iconButton} onPress={handleLock}>
+                <SimpleIcon name="lock-closed-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
+        )}
 
         {/* Search & Filter Section */}
         <View style={styles.searchSection}>
@@ -1244,5 +1335,30 @@ const styles = StyleSheet.create({
   },
   activeFilterPillText: {
     color: "#fff",
+  },
+  /* Selection Mode Styles */
+  selectedFileCard: {
+    backgroundColor: 'rgba(74, 144, 226, 0.15)',
+    borderColor: '#4a90e2',
+  },
+  selectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    paddingTop: 60,
+    paddingBottom: 20,
+    backgroundColor: "#1a1a2e",
+    borderBottomWidth: 1,
+    borderBottomColor: "#2a2a3e",
+  },
+  selectionTitle: {
+    fontSize: 20,
+    fontWeight: "bold",
+    color: "#fff",
+  },
+  selectionActions: {
+    flexDirection: "row",
+    gap: 16,
   },
 });
