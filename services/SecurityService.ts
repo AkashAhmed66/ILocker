@@ -1,8 +1,9 @@
 // IMPORTANT: Import polyfill FIRST before any crypto operations
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import CryptoJS from 'crypto-js';
+import { Buffer } from 'buffer';
 import 'react-native-get-random-values';
 import * as Keychain from 'react-native-keychain';
+import Crypto from 'react-native-quick-crypto';
 
 // Import MMKV with error handling
 let MMKV: any;
@@ -85,10 +86,11 @@ export interface FileMetadata {
   size: number;
   encryptedThumbnail?: string;
   timestamp: number;
+  version?: number;
 }
 
 class SecurityService {
-  private masterKey: string | null = null;
+  private masterKey: Buffer | null = null;
   private failedAttempts: number = 0;
   private readonly MAX_FAILED_ATTEMPTS = 5;
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
@@ -126,13 +128,13 @@ class SecurityService {
       } catch {
         credentials = await Keychain.getGenericPassword();
       }
-      
+
       if (credentials && credentials.password) {
         // Password exists in Keychain, update storage flag
         storage.set('password_set', true);
         return true;
       }
-      
+
       return false;
     } catch (error) {
       console.warn('Failed to check password:', error);
@@ -140,33 +142,22 @@ class SecurityService {
     }
   }
 
-  // Hash password with salt (optimized iterations for mobile)
+  // Hash password with salt using native PBKDF2
   private hashPassword(password: string, salt: string): string {
-    return CryptoJS.PBKDF2(password, salt, {
-      keySize: 256 / 32,
-      iterations: 5000, // Reduced from 10000 for faster login while maintaining security
-    }).toString();
+    // Original CryptoJS.PBKDF2 uses SHA1 by default, keySize 256/32 = 32 bytes
+    const key = Crypto.pbkdf2Sync(
+      password,
+      salt,
+      5000,
+      32, // 256 bits = 32 bytes
+      'sha1'
+    );
+    return key.toString('hex');
   }
 
   // Generate random salt
   private generateSalt(): string {
-    try {
-      // Try CryptoJS random first
-      return CryptoJS.lib.WordArray.random(128 / 8).toString();
-    } catch (error) {
-      // Fallback to JavaScript crypto API
-      console.warn('CryptoJS random failed, using fallback');
-      const array = new Uint8Array(16);
-      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-        crypto.getRandomValues(array);
-      } else {
-        // Last resort: Math.random (not cryptographically secure but works)
-        for (let i = 0; i < 16; i++) {
-          array[i] = Math.floor(Math.random() * 256);
-        }
-      }
-      return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
-    }
+    return Crypto.randomBytes(16).toString('hex'); // 16 bytes = 128 bits
   }
 
   // Set initial password
@@ -260,11 +251,14 @@ class SecurityService {
           }
         }
       }
-      
+
       if (!salt) {
         return false;
       }
 
+      // Replicate legacy hash with QuickCrypto for compatibility
+      // Original: CryptoJS.PBKDF2(password, salt, { keySize: 256/32, iterations: 5000 }).toString()
+      // CryptoJS PBKDF2 uses SHA1 by default.
       const hashedPassword = this.hashPassword(password, salt);
 
       if (hashedPassword === credentials.password) {
@@ -285,7 +279,7 @@ class SecurityService {
     }
   }
 
-  // Generate master key (optimized - only done once per login)
+  // Generate master key
   private async generateMasterKey(password: string): Promise<void> {
     try {
       // Check if we already have a cached master key
@@ -295,23 +289,29 @@ class SecurityService {
       }
 
       // Generate a strong master key using password (5K iterations for faster login)
-      const masterKey = CryptoJS.PBKDF2(password, 'ilocker-master-key-salt', {
-        keySize: 256 / 32,
-        iterations: 5000, // Reduced from 10000 for 2x faster performance
-      }).toString();
+      // Original: CryptoJS.PBKDF2(password, 'ilocker-master-key-salt', { keySize: 256/32, iterations: 5000 })
+      // CryptoJS PBKDF2 uses SHA1 by default.
+      const masterKeyBuffer = Crypto.pbkdf2Sync(
+        password,
+        'ilocker-master-key-salt',
+        5000,
+        32, // 256 bits = 32 bytes
+        'sha1'
+      );
 
-      this.masterKey = masterKey;
+      this.masterKey = masterKeyBuffer;
+      const masterKeyHex = masterKeyBuffer.toString('hex');
       console.log('Master key generated and cached successfully');
 
       // Try to store master key in secure keychain for session persistence
       try {
-        await Keychain.setGenericPassword('ilocker_master', masterKey, {
+        await Keychain.setGenericPassword('ilocker_master', masterKeyHex, {
           service: 'com.ilocker.masterkey',
           accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
         });
       } catch {
         // Fallback: store without options
-        await Keychain.setGenericPassword('ilocker_master', masterKey);
+        await Keychain.setGenericPassword('ilocker_master', masterKeyHex);
       }
     } catch (error) {
       console.error('Failed to generate master key:', error);
@@ -332,7 +332,7 @@ class SecurityService {
       }
 
       if (credentials && credentials.password) {
-        this.masterKey = credentials.password;
+        this.masterKey = Buffer.from(credentials.password, 'hex');
         console.log('Master key restored from keychain');
         this.startInactivityTimer();
         return true;
@@ -345,47 +345,57 @@ class SecurityService {
   }
 
   // Derive file-specific encryption key
-  private deriveFileKey(fileId: string): CryptoJS.lib.WordArray {
+  private deriveFileKey(fileId: string): Buffer {
     if (!this.masterKey) {
       console.error('Master key not available! Auth status:', this.isAuthenticated());
       throw new Error('Master key not available. Please authenticate first.');
     }
-    return CryptoJS.HmacSHA256(fileId, this.masterKey);
+    // Original: CryptoJS.HmacSHA256(fileId, this.masterKey);
+    // We must pass the key as buffer
+    return Crypto.createHmac('sha256', this.masterKey).update(fileId).digest();
   }
 
   // Generate deterministic IV from fileId (so same file always has same IV)
-  private generateDeterministicIV(fileId: string): CryptoJS.lib.WordArray {
-    // Use HMAC-SHA256 of fileId as IV source, then take first 16 bytes
-    const hash = CryptoJS.HmacSHA256(fileId, 'ilocker-iv-salt');
-    // Take first 128 bits (16 bytes) for IV
-    const words = hash.words.slice(0, 4); // 4 words = 128 bits
-    return CryptoJS.lib.WordArray.create(words, 16);
+  private generateDeterministicIV(fileId: string): Buffer {
+    // Original: CryptoJS.HmacSHA256(fileId, 'ilocker-iv-salt'), then take first 16 bytes
+    const hash = Crypto.createHmac('sha256', 'ilocker-iv-salt').update(fileId).digest();
+    return hash.subarray(0, 16); // Take first 16 bytes for IV
   }
 
-  // Encrypt data using AES-256-CBC (chunked for large files)
+  // Encrypt string data (returns Base64) - Legacy compatibility
   encryptData(data: string, fileId: string): string {
-    this.resetInactivityTimer(); // Keep session active
-    const fileKey = this.deriveFileKey(fileId);
-    const iv = this.generateDeterministicIV(fileId);
-    const encrypted = CryptoJS.AES.encrypt(data, fileKey, {
-      iv: iv,
-      mode: CryptoJS.mode.CBC,
-      padding: CryptoJS.pad.Pkcs7,
-    });
-    return encrypted.toString();
+    const buffer = Buffer.from(data, 'utf8');
+    const encrypted = this.encryptBuffer(buffer, fileId);
+    return encrypted.toString('base64');
   }
 
-  // Decrypt data (chunked for large files)
-  decryptData(encryptedData: string, fileId: string): string {
+  // Decrypt string data (expects Base64, returns string) - Legacy compatibility
+  decryptData(encryptedBase64: string, fileId: string): string {
+    const buffer = Buffer.from(encryptedBase64, 'base64');
+    const decrypted = this.decryptBuffer(buffer, fileId);
+    return decrypted.toString('utf8');
+  }
+
+  // Encrypt Buffer (Native)
+  encryptBuffer(data: Buffer, fileId: string): Buffer {
     this.resetInactivityTimer(); // Keep session active
-    const fileKey = this.deriveFileKey(fileId);
+    const key = this.deriveFileKey(fileId);
     const iv = this.generateDeterministicIV(fileId);
-    const decrypted = CryptoJS.AES.decrypt(encryptedData, fileKey, {
-      iv: iv,
-      mode: CryptoJS.mode.CBC,
-      padding: CryptoJS.pad.Pkcs7,
-    });
-    return decrypted.toString(CryptoJS.enc.Utf8);
+
+    const cipher = Crypto.createCipheriv('aes-256-cbc', key, iv);
+    const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
+    return encrypted;
+  }
+
+  // Decrypt Buffer (Native)
+  decryptBuffer(encryptedData: Buffer, fileId: string): Buffer {
+    this.resetInactivityTimer(); // Keep session active
+    const key = this.deriveFileKey(fileId);
+    const iv = this.generateDeterministicIV(fileId);
+
+    const decipher = Crypto.createDecipheriv('aes-256-cbc', key, iv);
+    const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+    return decrypted;
   }
 
   // Encrypt large data in chunks (non-blocking with progress callback)
@@ -396,20 +406,22 @@ class SecurityService {
   ): Promise<string> {
     this.resetInactivityTimer();
     const CHUNK_SIZE = 500000; // 500KB chunks for better performance
-    const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
+    const dataBuffer = Buffer.from(data, 'utf8');
+    const totalChunks = Math.ceil(dataBuffer.length / CHUNK_SIZE);
     const encryptedChunks: string[] = [];
 
     for (let i = 0; i < totalChunks; i++) {
       // Yield to main thread between chunks to keep UI responsive
       await new Promise(resolve => setTimeout(resolve, 0));
-      
+
       const start = i * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, data.length);
-      const chunk = data.substring(start, end);
-      
-      const encryptedChunk = this.encryptData(chunk, `${fileId}_chunk_${i}`);
-      encryptedChunks.push(encryptedChunk);
-      
+      const end = Math.min(start + CHUNK_SIZE, dataBuffer.length);
+      const chunk = dataBuffer.subarray(start, end);
+
+      // Each chunk is encrypted independently with a unique fileId for its key/IV derivation
+      const encryptedChunk = this.encryptBuffer(chunk, `${fileId}_chunk_${i}`);
+      encryptedChunks.push(encryptedChunk.toString('base64')); // Store as base64 string
+
       if (onProgress) {
         onProgress(((i + 1) / totalChunks) * 100);
       }
@@ -426,7 +438,7 @@ class SecurityService {
     onProgress?: (progress: number) => void
   ): Promise<string> {
     this.resetInactivityTimer();
-    
+
     // Check if data is chunked
     if (!encryptedData.includes('|||CHUNK|||')) {
       // Old format or small file - decrypt directly
@@ -434,21 +446,23 @@ class SecurityService {
     }
 
     const chunks = encryptedData.split('|||CHUNK|||');
-    const decryptedChunks: string[] = [];
+    const decryptedBuffers: Buffer[] = [];
 
     for (let i = 0; i < chunks.length; i++) {
       // Yield to main thread between chunks
       await new Promise(resolve => setTimeout(resolve, 0));
-      
-      const decryptedChunk = this.decryptData(chunks[i], `${fileId}_chunk_${i}`);
-      decryptedChunks.push(decryptedChunk);
-      
+
+      // Each chunk is decrypted independently using its unique fileId
+      const encryptedChunkBuffer = Buffer.from(chunks[i], 'base64');
+      const decryptedChunk = this.decryptBuffer(encryptedChunkBuffer, `${fileId}_chunk_${i}`);
+      decryptedBuffers.push(decryptedChunk);
+
       if (onProgress) {
         onProgress(((i + 1) / chunks.length) * 100);
       }
     }
 
-    return decryptedChunks.join('');
+    return Buffer.concat(decryptedBuffers).toString('utf8');
   }
 
   // Store file metadata
@@ -520,9 +534,13 @@ class SecurityService {
         await Keychain.resetGenericPassword();
       }
       try {
-        await Keychain.resetGenericPassword({ service: 'com.ilocker.masterkey' });
+        try {
+          await Keychain.resetGenericPassword({ service: 'com.ilocker.masterkey' });
+        } catch {
+          // Already reset or not available
+        }
       } catch {
-        // Already reset or not available
+        // Safe to ignore
       }
       storage.clearAll();
       this.masterKey = null;

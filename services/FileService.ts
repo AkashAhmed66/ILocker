@@ -1,3 +1,4 @@
+import { Buffer } from 'buffer';
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
@@ -5,13 +6,15 @@ import * as MediaLibrary from "expo-media-library";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 import BackgroundService from "react-native-background-actions";
+import * as RNFS from 'react-native-fs';
 import "react-native-get-random-values";
 import BackgroundTaskManager from "./BackgroundTaskManager";
 import SecurityService, { FileMetadata } from "./SecurityService";
 
-// Task names for background operations
+// Task names
 const BACKGROUND_UPLOAD_TASK = "background-upload-task";
 const BACKGROUND_DOWNLOAD_TASK = "background-download-task";
+const CHUNK_SIZE = 512 * 1024; // 512KB
 
 // Configure notifications
 Notifications.setNotificationHandler({
@@ -25,7 +28,6 @@ Notifications.setNotificationHandler({
   }),
 });
 
-// Set up notification channel for Android
 if (Platform.OS === 'android') {
   Notifications.setNotificationChannelAsync('file-operations', {
     name: 'File Operations',
@@ -48,14 +50,13 @@ export interface FileOperation {
 }
 
 class FileService {
-  private readonly SECURE_DIR = `${FileSystem.documentDirectory || "file:///"}secure/`;
-  private readonly THUMBNAIL_DIR = `${FileSystem.documentDirectory || "file:///"}thumbnails/`;
+  // Use RNFS paths for main storage to allow seek/append
+  private readonly SECURE_DIR = `${RNFS.DocumentDirectoryPath}/secure/`;
+  private readonly THUMBNAIL_DIR = `${RNFS.DocumentDirectoryPath}/thumbnails/`;
+  private readonly CACHE_DIR = `${RNFS.CachesDirectoryPath}/decrypted/`;
+
   private activeOperations: Map<string, FileOperation> = new Map();
   private operationListeners: Map<string, (op: FileOperation) => void> = new Map();
-  private backgroundNotificationIds: Map<string, string> = new Map();
-  private keepAliveTimers: Map<string, NodeJS.Timeout> = new Map();
-  private lastNotificationUpdate: Map<string, number> = new Map();
-  private readonly NOTIFICATION_UPDATE_THROTTLE = 2000; // Update notification max every 2 seconds
   private backgroundServiceRunning = false;
   private activeBackgroundOperations = 0;
   private cancelledOperations: Set<string> = new Set();
@@ -63,289 +64,134 @@ class FileService {
   // Initialize secure directory
   async initializeSecureStorage(): Promise<void> {
     try {
-      // Create secure directory
-      const dirInfo = await FileSystem.getInfoAsync(this.SECURE_DIR);
-      if (!dirInfo.exists) {
-        await FileSystem.makeDirectoryAsync(this.SECURE_DIR, {
-          intermediates: true,
-        });
+      if (!(await RNFS.exists(this.SECURE_DIR))) {
+        await RNFS.mkdir(this.SECURE_DIR);
+      }
+      if (!(await RNFS.exists(this.THUMBNAIL_DIR))) {
+        await RNFS.mkdir(this.THUMBNAIL_DIR);
+      }
+      if (!(await RNFS.exists(this.CACHE_DIR))) {
+        await RNFS.mkdir(this.CACHE_DIR);
+      } else {
+        // Clean cache on init
+        await RNFS.unlink(this.CACHE_DIR);
+        await RNFS.mkdir(this.CACHE_DIR);
       }
 
-      // Create thumbnail directory
-      const thumbInfo = await FileSystem.getInfoAsync(this.THUMBNAIL_DIR);
-      if (!thumbInfo.exists) {
-        await FileSystem.makeDirectoryAsync(this.THUMBNAIL_DIR, {
-          intermediates: true,
-        });
-      }
-
-      // Create .nomedia file for Android
+      // .nomedia for Android
       const nomediaPath = `${this.SECURE_DIR}.nomedia`;
-      const nomediaInfo = await FileSystem.getInfoAsync(nomediaPath);
-      if (!nomediaInfo.exists) {
-        await FileSystem.writeAsStringAsync(nomediaPath, "");
+      if (!(await RNFS.exists(nomediaPath))) {
+        await RNFS.writeFile(nomediaPath, "", 'utf8');
       }
 
-      // Request notification permissions
       await this.requestNotificationPermissions();
-      
-      // Register background task
       await BackgroundTaskManager.registerBackgroundTask();
     } catch (error) {
       console.warn("Failed to initialize secure storage:", error);
     }
   }
 
-  // Request notification permissions
   private async requestNotificationPermissions(): Promise<void> {
     try {
       const { status: existingStatus } = await Notifications.getPermissionsAsync();
       let finalStatus = existingStatus;
-      
       if (existingStatus !== 'granted') {
         const { status } = await Notifications.requestPermissionsAsync();
         finalStatus = status;
-      }
-      
-      if (finalStatus !== 'granted') {
-        console.warn('Notification permissions not granted');
       }
     } catch (error) {
       console.warn('Failed to request notification permissions:', error);
     }
   }
 
-  // Subscribe to operation updates
   subscribeToOperation(operationId: string, callback: (op: FileOperation) => void): () => void {
     this.operationListeners.set(operationId, callback);
+    // Immediate callback with current state
+    const op = this.activeOperations.get(operationId);
+    if (op) callback(op);
     return () => this.operationListeners.delete(operationId);
   }
 
-  // Update operation status
+  getActiveOperations(): FileOperation[] {
+    return Array.from(this.activeOperations.values());
+  }
+
   private updateOperation(operationId: string, updates: Partial<FileOperation>): void {
     const operation = this.activeOperations.get(operationId);
     if (operation) {
       Object.assign(operation, updates);
-      
-      // Background service notification will show progress automatically
-      // this.updatePersistentNotification(operationId, operation);
-      
       const listener = this.operationListeners.get(operationId);
-      if (listener) {
-        listener(operation);
-      }
+      if (listener) listener(operation);
     }
   }
 
-  // Create persistent notification for background operation
-  private async createPersistentNotification(
-    operationId: string,
-    operation: FileOperation
-  ): Promise<void> {
-    try {
-      const identifier = `file-operation-${operationId}`;
-      
-      await Notifications.scheduleNotificationAsync({
-        identifier,
-        content: {
-          title: operation.type === 'upload' ? '🔒 Encrypting File' : '🔓 Decrypting File',
-          body: operation.fileName,
-          sound: false,
-          sticky: true,
-          priority: Notifications.AndroidNotificationPriority.MAX,
-          data: { operationId, progress: 0 },
-          ...(Platform.OS === 'android' && {
-            categoryIdentifier: 'file-operations',
-          }),
-        },
-        trigger: null,
-      });
-      
-      this.backgroundNotificationIds.set(operationId, identifier);
-      this.lastNotificationUpdate.set(operationId, Date.now());
-    } catch (error) {
-      console.warn('Failed to create persistent notification:', error);
+  cancelOperation(operationId: string) {
+    if (this.activeOperations.has(operationId)) {
+      this.cancelledOperations.add(operationId);
+      this.updateOperation(operationId, { status: 'failed', error: 'Cancelled by user' });
+      // Clean up after short delay
+      setTimeout(() => {
+        this.activeOperations.delete(operationId);
+        this.cancelledOperations.delete(operationId);
+      }, 2000);
     }
   }
 
-  // Update persistent notification with progress (throttled)
-  private async updatePersistentNotification(
-    operationId: string,
-    operation: FileOperation
-  ): Promise<void> {
-    try {
-      const identifier = this.backgroundNotificationIds.get(operationId);
-      if (!identifier || operation.status !== 'processing') return;
-      
-      // Throttle updates - only update if enough time has passed
-      const lastUpdate = this.lastNotificationUpdate.get(operationId) || 0;
-      const now = Date.now();
-      const timeSinceLastUpdate = now - lastUpdate;
-      
-      // Only update if 2 seconds have passed OR progress is at key milestones
-      const isKeyMilestone = operation.progress % 25 === 0 || operation.progress >= 95;
-      if (timeSinceLastUpdate < this.NOTIFICATION_UPDATE_THROTTLE && !isKeyMilestone) {
-        return;
-      }
-      
-      this.lastNotificationUpdate.set(operationId, now);
-      
-      // Update the same notification in place
-      await Notifications.scheduleNotificationAsync({
-        identifier, // Reuse same identifier to update in place
-        content: {
-          title: operation.type === 'upload' ? '🔒 Encrypting File' : '🔓     File',
-          body: `${operation.fileName} - ${Math.round(operation.progress)}%`,
-          sound: false,
-          sticky: true,
-          priority: Notifications.AndroidNotificationPriority.MAX,
-          data: { operationId, progress: operation.progress },
-          ...(Platform.OS === 'android' && {
-            categoryIdentifier: 'file-operations',
-          }),
-        },
-        trigger: null,
-      });
-    } catch (error) {
-      console.warn('Failed to update persistent notification:', error);
-    }
+  isCancelled(operationId: string): boolean {
+    return this.cancelledOperations.has(operationId);
   }
 
-  // Remove persistent notification
-  private async removePersistentNotification(operationId: string): Promise<void> {
-    try {
-      const identifier = this.backgroundNotificationIds.get(operationId);
-      if (identifier) {
-        await Notifications.dismissNotificationAsync(identifier);
-        this.backgroundNotificationIds.delete(operationId);
-        this.lastNotificationUpdate.delete(operationId);
-      }
-    } catch (error) {
-      console.warn('Failed to remove persistent notification:', error);
-    }
-  }
-
-  // Start background service to keep operations running
   private async startBackgroundService(): Promise<void> {
-    if (this.backgroundServiceRunning) {
-      return;
-    }
-
+    if (this.backgroundServiceRunning) return;
     try {
-      const options = {
+      await BackgroundService.start(this.backgroundTask, {
         taskName: 'ILocker File Processing',
         taskTitle: 'Processing Files',
-        taskDesc: 'Encrypting or decrypting your files securely',
-        taskIcon: {
-          name: 'ic_launcher',
-          type: 'mipmap',
-        },
+        taskDesc: 'Securing your data...',
+        taskIcon: { name: 'ic_launcher', type: 'mipmap' },
         color: '#4a90e2',
         linkingURI: 'ilocker://',
-        progressBar: {
-          max: 100,
-          value: 0,
-          indeterminate: false,
-        },
-        parameters: {
-          delay: 1000,
-        },
-      };
-
-      await BackgroundService.start(this.backgroundTask, options);
+        progressBar: { max: 100, value: 0, indeterminate: false },
+      });
       this.backgroundServiceRunning = true;
-      console.log('[BackgroundService] Started');
     } catch (error) {
-      console.warn('[BackgroundService] Failed to start:', error);
+      console.warn('Background service fail:', error);
     }
   }
 
-  // Background task that keeps running
-  private backgroundTask = async (taskData: any) => {
+  private backgroundTask = async () => {
     await new Promise(async (resolve) => {
-      // Keep running while there are active operations
       while (this.activeBackgroundOperations > 0) {
-        const operations = Array.from(this.activeOperations.values());
-        const processingOps = operations.filter(op => op.status === 'processing');
-        
-        let taskTitle = 'Processing';
-        let taskDesc = '';
-        
-        if (processingOps.length === 1) {
-          const op = processingOps[0];
-          const action = op.type === 'upload' ? 'Encrypting' : 'Decrypting';
-          const percentage = Math.round(op.progress);
-          taskTitle = `${percentage}% ${action}`;
-          taskDesc = op.fileName;
-        } else if (processingOps.length > 1) {
-          const percentage = Math.round(this.getAverageProgress());
-          taskTitle = `${percentage}% Processing`;
-          taskDesc = `${processingOps.length} files`;
+        const operations = Array.from(this.activeOperations.values()).filter(op => op.status === 'processing');
+        if (operations.length > 0) {
+          const avgProgress = operations.reduce((sum, op) => sum + op.progress, 0) / operations.length;
+          await BackgroundService.updateNotification({
+            taskTitle: `${operations.length} Active Operations`,
+            taskDesc: `Processing... ${Math.round(avgProgress)}%`,
+            progressBar: { max: 100, value: avgProgress, indeterminate: false },
+          });
         }
-        
-        await BackgroundService.updateNotification({
-          taskTitle,
-          taskDesc,
-          progressBar: {
-            max: 100,
-            value: this.getAverageProgress(),
-            indeterminate: false,
-          },
-        });
-        
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(r => setTimeout(r, 1000));
       }
-      
       resolve(undefined);
     });
   };
 
-  // Get average progress of all operations
-  private getAverageProgress(): number {
-    const operations = Array.from(this.activeOperations.values());
-    if (operations.length === 0) return 0;
-    
-    const total = operations.reduce((sum, op) => sum + op.progress, 0);
-    return Math.round(total / operations.length);
-  }
-
-  // Stop background service
   private async stopBackgroundService(): Promise<void> {
-    if (!this.backgroundServiceRunning) {
-      return;
-    }
-
+    if (!this.backgroundServiceRunning) return;
     try {
       await BackgroundService.stop();
       this.backgroundServiceRunning = false;
-      console.log('[BackgroundService] Stopped');
-    } catch (error) {
-      console.warn('[BackgroundService] Failed to stop:', error);
+    } catch (e) {
+      console.warn('Stop bg service fail', e);
     }
   }
 
-  // Show notification
-  private async showNotification(title: string, body: string): Promise<void> {
-    try {
-      await Notifications.scheduleNotificationAsync({
-        content: {
-          title,
-          body,
-          sound: true,
-        },
-        trigger: null, // Show immediately
-      });
-    } catch (error) {
-      console.warn('Failed to show notification:', error);
-    }
-  }
-
-  // Generate unique file ID
   private generateFileId(): string {
-    return `${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+    return `${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
   }
 
-  // Pick document(s)
+  // Pick Document
   async pickDocument(): Promise<FileMetadata[]> {
     try {
       const result = await DocumentPicker.getDocumentAsync({
@@ -353,20 +199,14 @@ class FileService {
         copyToCacheDirectory: true,
         multiple: true,
       });
-
-      if (result.canceled) {
-        return [];
-      }
+      if (result.canceled) return [];
 
       const files: FileMetadata[] = [];
       for (const file of result.assets) {
-        const metadata = await this.secureFile(
-          file.uri,
-          file.name,
-          file.mimeType || "application/octet-stream",
-          file.size || 0,
-        );
-        files.push(metadata);
+        // For Expo Document Picker, uri might be content:// on Android
+        // RNFS can read content:// uris on Android usually.
+        // Or we might need to copy to cache first (Expo does this 'copyToCacheDirectory: true' -> cache uri).
+        files.push(await this.secureFile(file.uri, file.name, file.mimeType || "application/octet-stream", file.size || 0));
       }
       return files;
     } catch (error) {
@@ -375,89 +215,57 @@ class FileService {
     }
   }
 
-  // Pick image(s)
+  // Pick Image
   async pickImage(): Promise<FileMetadata[]> {
-    try {
-      const { status } =
-        await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== "granted") {
-        throw new Error("Permission denied");
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== "granted") throw new Error("Permission denied");
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      quality: 1,
+      allowsMultipleSelection: true,
+      mediaTypes: ImagePicker.MediaTypeOptions.All,
+    });
+    if (result.canceled) return [];
+
+    const files: FileMetadata[] = [];
+    for (const asset of result.assets) {
+      const fileName = asset.uri.split("/").pop() || "image.jpg";
+      const mimeType = asset.mimeType || (asset.type === "video" ? "video/mp4" : "image/jpeg");
+      // Get file size if not provided
+      let size = asset.fileSize || 0;
+      if (size === 0) {
+        // Try to get size
+        try {
+          const stat = await RNFS.stat(asset.uri); // Might fail if it's content:// without copy
+          size = stat.size;
+        } catch { } // Ignore
       }
 
-      const result = await ImagePicker.launchImageLibraryAsync({
-        quality: 1,
-        allowsMultipleSelection: true,
-        mediaTypes: ImagePicker.MediaTypeOptions.All,
-      });
-
-      if (result.canceled) {
-        return [];
-      }
-
-      const files: FileMetadata[] = [];
-      for (const asset of result.assets) {
-        const fileName = asset.uri.split("/").pop() || "image.jpg";
-        const fileSize = asset.fileSize || 0;
-        const mimeType =
-          asset.mimeType ||
-          (asset.type === "video" ? "video/mp4" : "image/jpeg");
-
-        const metadata = await this.secureFile(
-          asset.uri,
-          fileName,
-          mimeType,
-          fileSize,
-        );
-        files.push(metadata);
-      }
-
-      return files;
-    } catch (error) {
-      console.error("Image picker error:", error);
-      return [];
+      files.push(await this.secureFile(asset.uri, fileName, mimeType, size));
     }
+    return files;
   }
 
-  // Take photo
+  // Take Photo
   async takePhoto(): Promise<FileMetadata | null> {
-    try {
-      const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      if (status !== "granted") {
-        throw new Error("Permission denied");
-      }
+    const { status } = await ImagePicker.requestCameraPermissionsAsync();
+    if (status !== "granted") throw new Error("Permission denied");
 
-      const result = await ImagePicker.launchCameraAsync({
-        quality: 1,
-      });
+    const result = await ImagePicker.launchCameraAsync({ quality: 1 });
+    if (result.canceled) return null;
 
-      if (result.canceled) {
-        return null;
-      }
-
-      const asset = result.assets[0];
-      const fileName = `photo_${Date.now()}.jpg`;
-      const fileSize = asset.fileSize || 0;
-
-      return await this.secureFile(asset.uri, fileName, "image/jpeg", fileSize);
-    } catch (error) {
-      console.error("Camera error:", error);
-      return null;
-    }
+    const asset = result.assets[0];
+    const fileName = `photo_${Date.now()}.jpg`;
+    return await this.secureFile(asset.uri, fileName, "image/jpeg", asset.fileSize || 0);
   }
 
-  // Encrypt and store file securely (with progress tracking)
-  private async secureFile(
-    sourceUri: string,
-    originalName: string,
-    fileType: string,
-    size: number,
-  ): Promise<FileMetadata> {
+  // Core Encryption Logic (Streamed)
+  private async secureFile(sourceUri: string, originalName: string, fileType: string, size: number): Promise<FileMetadata> {
     await this.initializeSecureStorage();
-
     const fileId = this.generateFileId();
     const operationId = fileId;
-    
-    // Create operation tracker
+
+    // Start tracking
     const operation: FileOperation = {
       id: operationId,
       type: 'upload',
@@ -466,320 +274,264 @@ class FileService {
       status: 'processing',
     };
     this.activeOperations.set(operationId, operation);
-    
-    // Start background service (will show progress notification)
-    // await this.createPersistentNotification(operationId, operation);
     this.activeBackgroundOperations++;
-    await this.startBackgroundService();
+    this.startBackgroundService();
 
     try {
-      const encryptedFileName = `${fileId}.enc`;
-      const encryptedPath = `${this.SECURE_DIR}${encryptedFileName}`;
+      const destPath = `${this.SECURE_DIR}${fileId}.enc`;
 
-      // Update progress: Reading file
-      this.updateOperation(operationId, { progress: 5 });
-      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
+      // We might need to handle content:// URIs by copying to a temp file first if RNFS read fails
+      // But typically RNFS.readFile works with valid file URIs.
+      // Expo cache URIs are file://.
 
-      // Check file size - if > 500MB, reject it to prevent OOM
-      // Note: Actual limit depends on device memory (base64 inflates size by ~33%)
-      if (size > 100 * 1024 * 1024) {
-        const sizeMB = Math.round(size / (1024 * 1024));
-        throw new Error(`File too large (${sizeMB}MB). Maximum size is 100MB.`);
+      let readPath = sourceUri;
+      if (sourceUri.startsWith('content://')) {
+        // Copy to temp for stable reading
+        const tempPath = `${RNFS.CachesDirectoryPath}/${fileId}_temp`;
+        // Expo FileSystem copy works with content:// better
+        await FileSystem.copyAsync({ from: sourceUri, to: tempPath });
+        readPath = tempPath;
+      } else if (sourceUri.startsWith('file://')) {
+        // Determine if we need to decode URI
+        readPath = sourceUri.replace('file://', '');
+        readPath = decodeURIComponent(readPath);
       }
 
-      // Warn for files > 50MB
-      if (size > 50 * 1024 * 1024) {
-        console.warn(`Large file detected: ${Math.round(size / (1024 * 1024))}MB - may cause memory issues`);
+      // Check file stats
+      const stat = await RNFS.stat(readPath);
+      const fileSize = parseInt(stat.size.toString()); // Ensure number
+
+      let offset = 0;
+      let chunkIndex = 0;
+
+      // Create file
+      await RNFS.writeFile(destPath, '', 'utf8');
+
+      while (offset < fileSize) {
+        if (this.isCancelled(operationId)) throw new Error('Cancelled');
+
+        const length = Math.min(CHUNK_SIZE, fileSize - offset);
+
+        // Read chunk as base64
+        const chunkBase64 = await RNFS.read(readPath, length, offset, 'base64');
+        const chunkBuffer = Buffer.from(chunkBase64, 'base64');
+
+        // Encrypt (chunkIndex is key to deterministic IV)
+        // Note: Using unique ID per chunk for IV derivation
+        const encryptedBuffer = SecurityService.encryptBuffer(chunkBuffer, `${fileId}_chunk_${chunkIndex}`);
+
+        // Format: [4 bytes length][Encrypted Data]
+        const lengthHeader = Buffer.alloc(4);
+        lengthHeader.writeUInt32BE(encryptedBuffer.length, 0);
+
+        // Combine header + encrypted data
+        const packet = Buffer.concat([lengthHeader, encryptedBuffer]);
+
+        // Append to file (RNFS append expects base64 for binary write)
+        await RNFS.appendFile(destPath, packet.toString('base64'), 'base64');
+
+        offset += length;
+        chunkIndex++;
+
+        const progress = Math.min(95, (offset / fileSize) * 100);
+        this.updateOperation(operationId, { progress });
+
+        // Yield to UI
+        await new Promise(r => setTimeout(r, 0));
       }
 
-      // For large files (> 10MB), read and process in chunks to avoid OOM
-      let fileContent: string;
-      let encryptedContent: string;
-      
-      if (size > 10 * 1024 * 1024) {
-        // Large file: Read in smaller base64 chunks
-        this.updateOperation(operationId, { progress: 10 });
-        
-        try {
-          // Read entire file (will use native memory more efficiently)
-          fileContent = await FileSystem.readAsStringAsync(sourceUri, {
-            encoding: "base64" as any,
-          });
-          
-          this.updateOperation(operationId, { progress: 25 });
-          if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-          
-          // Process in chunks
-          encryptedContent = await SecurityService.encryptDataChunked(
-            fileContent,
-            fileId,
-            (chunkProgress) => {
-              if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-              this.updateOperation(operationId, { 
-                progress: 25 + (chunkProgress * 0.6) // 25-85%
-              });
-            }
-          );
-          
-          // Clear fileContent from memory
-          fileContent = '';
-        } catch (error: any) {
-          if (error.message?.includes('OutOfMemoryError') || error.message?.includes('allocation')) {
-            const sizeMB = Math.round(size / (1024 * 1024));
-            throw new Error(`File too large (${sizeMB}MB). Your device doesn't have enough memory. Try a file under ${Math.max(20, Math.floor(sizeMB * 0.5))}MB.`);
-          }
-          throw error;
-        }
-      } else {
-        // Small file: Normal processing
-        this.updateOperation(operationId, { progress: 15 });
-        
-        fileContent = await FileSystem.readAsStringAsync(sourceUri, {
-          encoding: "base64" as any,
-        });
-
-        this.updateOperation(operationId, { progress: 40 });
-        if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-
-        // Encrypt with or without chunking based on size
-        if (fileContent.length > 1000000) {
-          encryptedContent = await SecurityService.encryptDataChunked(
-            fileContent,
-            fileId,
-            (chunkProgress) => {
-              if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-              this.updateOperation(operationId, { 
-                progress: 40 + (chunkProgress * 0.45) // 40-85%
-              });
-            }
-          );
-        } else {
-          encryptedContent = SecurityService.encryptData(fileContent, fileId);
-        }
-      }
-
-      // Update progress: Writing file
-      this.updateOperation(operationId, { progress: 88 });
-      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-
-      // Write encrypted file
-      await FileSystem.writeAsStringAsync(encryptedPath, encryptedContent, {
-        encoding: "utf8" as any,
-      });
-
-      // Generate and store thumbnail if image (read again for thumbnail if needed)
+      // Generate thumbnail if image/video
       let encryptedThumbnail: string | undefined;
-      if (fileType.startsWith("image/") && size < 10 * 1024 * 1024) {
-        // Only generate thumbnails for images < 10MB
+      // Handle Image/Video thumbnail generation... (omitted for brevity, can keep old logic mostly)
+      // Actually let's try to grab a thumbnail from original file if it's small or use expo-video-thumbnails
+      if (fileType.startsWith('image/')) {
         try {
-          const thumbData = await FileSystem.readAsStringAsync(sourceUri, {
-            encoding: "base64" as any,
-          });
-          await this.generateThumbnail(thumbData, fileId, fileType);
+          // Read small chunk for thumb
+          const thumbData = await RNFS.read(readPath, 50000, 0, 'base64');
+          const encryptedThumb = SecurityService.encryptData(thumbData, `${fileId}_thumb`);
+          await RNFS.writeFile(`${this.THUMBNAIL_DIR}${fileId}.thumb`, encryptedThumb, 'utf8');
           encryptedThumbnail = 'stored';
-        } catch (error) {
-          console.warn('Failed to generate thumbnail:', error);
-        }
+        } catch (e) { }
       }
 
-      // Update progress: Finalizing
-      this.updateOperation(operationId, { progress: 95 });
+      // Clean up temp
+      if (sourceUri !== readPath) {
+        await RNFS.unlink(readPath);
+      }
 
       const metadata: FileMetadata = {
         id: fileId,
         originalName,
-        encryptedPath,
+        encryptedPath: destPath,
         fileType,
-        size,
+        size: fileSize,
         encryptedThumbnail,
         timestamp: Date.now(),
+        version: 2 // Mark as Streaming Version
       };
 
-      // Store metadata
       SecurityService.storeFileMetadata(metadata);
 
-      // Delete original file if it was copied to cache
-      try {
-        if (sourceUri.includes("cache")) {
-          await FileSystem.deleteAsync(sourceUri, { idempotent: true });
-        }
-      } catch (error) {
-        console.warn("Could not delete cached file:", error);
-      }
-
-      // Complete operation
       this.updateOperation(operationId, { progress: 100, status: 'completed' });
-      
-      // Stop background service if no more operations
-      // await this.removePersistentNotification(operationId);
-      this.activeBackgroundOperations--;
-      if (this.activeBackgroundOperations === 0) {
-        await this.stopBackgroundService();
-      }
-      
-      // Show completion notification
-      await this.showNotification(
-        "File Secured ✓",
-        `${originalName} has been encrypted and stored securely`
-      );
-
-      // Clean up operation after delay
-      setTimeout(() => this.activeOperations.delete(operationId), 3000);
+      await Notifications.scheduleNotificationAsync({
+        content: { title: "File Secured ✓", body: originalName },
+        trigger: null,
+      });
 
       return metadata;
-    } catch (error) {
-      this.updateOperation(operationId, { 
-        status: 'failed', 
-        error: error instanceof Error ? error.message : 'Unknown error'
-      });
-      
-      // Stop background service if no more operations
-      // await this.removePersistentNotification(operationId);
-      this.activeBackgroundOperations--;
-      if (this.activeBackgroundOperations === 0) {
-        await this.stopBackgroundService();
-      }
-      
-      await this.showNotification(
-        "Upload Failed ✗",
-        `Failed to secure ${originalName}`
-      );
-      
+
+    } catch (error: any) {
+      this.updateOperation(operationId, { status: 'failed', error: error.message });
       throw error;
+    } finally {
+      this.activeBackgroundOperations--;
+      if (this.activeBackgroundOperations === 0) this.stopBackgroundService();
+      setTimeout(() => this.activeOperations.delete(operationId), 5000);
     }
   }
 
-  // Generate thumbnail for images (stored separately)
-  private async generateThumbnail(
-    base64Data: string,
-    fileId: string,
-    fileType: string
-  ): Promise<void> {
-    try {
-      // Take first 50KB as thumbnail data (rough compression)
-      const thumbnailData = base64Data.substring(0, 50000);
-      const thumbnailPath = `${this.THUMBNAIL_DIR}${fileId}.thumb`;
-      
-      // Encrypt thumbnail
-      const encryptedThumb = SecurityService.encryptData(thumbnailData, `${fileId}_thumb`);
-      
-      // Store thumbnail
-      await FileSystem.writeAsStringAsync(thumbnailPath, encryptedThumb, {
-        encoding: "utf8" as any,
-      });
-    } catch (error) {
-      console.warn('Failed to generate thumbnail:', error);
+  // Decrypt to Temp File (for Preview/Sharing)
+  async getSecureFileUri(fileId: string, onProgress?: (p: number) => void): Promise<string | null> {
+    const metadata = SecurityService.getAllFileMetadata().find(f => f.id === fileId);
+    if (!metadata) throw new Error("File not found");
+
+    const destPath = `${this.CACHE_DIR}${fileId}_decrypted.${this.getExtension(metadata.originalName)}`;
+
+    // Check if already decrypted
+    if (await RNFS.exists(destPath)) {
+      if (onProgress) onProgress(100);
+      return `file://${destPath}`;
     }
-  }
 
-  // Get thumbnail for file
-  async getThumbnail(fileId: string): Promise<string | null> {
     try {
-      const thumbnailPath = `${this.THUMBNAIL_DIR}${fileId}.thumb`;
-      const thumbInfo = await FileSystem.getInfoAsync(thumbnailPath);
-      
-      if (!thumbInfo.exists) return null;
-      
-      const encryptedThumb = await FileSystem.readAsStringAsync(thumbnailPath, {
-        encoding: "utf8" as any,
-      });
-      
-      return SecurityService.decryptData(encryptedThumb, `${fileId}_thumb`);
-    } catch (error) {
-      console.warn('Failed to get thumbnail:', error);
-      return null;
-    }
-  }
+      if (metadata.version === 2) {
+        // V2: Streaming format [Length][Chunk]...
+        const fileStat = await RNFS.stat(metadata.encryptedPath);
+        const totalSize = parseInt(fileStat.size.toString());
+        let offset = 0;
+        let chunkIndex = 0;
 
-  // Decrypt and read file (with progress tracking)
-  async readSecureFile(
-    fileId: string,
-    onProgress?: (progress: number) => void
-  ): Promise<string | null> {
-    try {
-      const metadata = SecurityService.getAllFileMetadata().find(
-        (f) => f.id === fileId,
-      );
-      if (!metadata) {
-        throw new Error("File not found");
-      }
+        await RNFS.writeFile(destPath, '', 'utf8'); // Empty file
 
-      if (onProgress) onProgress(10);
+        while (offset < totalSize) {
+          // Read 4 bytes length
+          const headerBase64 = await RNFS.read(metadata.encryptedPath, 4, offset, 'base64');
+          const headerBuf = Buffer.from(headerBase64, 'base64');
+          const chunkLen = headerBuf.readUInt32BE(0);
+          offset += 4;
 
-      // Read encrypted file
-      const encryptedContent = await FileSystem.readAsStringAsync(
-        metadata.encryptedPath,
-        {
-          encoding: "utf8" as any,
-        },
-      );
+          // Read chunk
+          const chunkBase64 = await RNFS.read(metadata.encryptedPath, chunkLen, offset, 'base64');
+          const chunkBuf = Buffer.from(chunkBase64, 'base64');
 
-      if (onProgress) onProgress(30);
+          // Decrypt
+          const decryptedBuf = SecurityService.decryptBuffer(chunkBuf, `${fileId}_chunk_${chunkIndex}`);
 
-      // Decrypt content with progress for large files
-      let decryptedContent: string;
-      if (encryptedContent.length > 1000000) { // > 1MB
-        decryptedContent = await SecurityService.decryptDataChunked(
-          encryptedContent,
-          fileId,
-          (chunkProgress) => {
-            if (onProgress) onProgress(30 + (chunkProgress * 0.6)); // 30-90%
-          }
-        );
+          // Append
+          await RNFS.appendFile(destPath, decryptedBuf.toString('base64'), 'base64');
+
+          offset += chunkLen;
+          chunkIndex++;
+
+          if (onProgress) onProgress((offset / totalSize) * 100);
+          // Yield to UI
+          await new Promise(r => setTimeout(r, 0));
+        }
       } else {
-        decryptedContent = SecurityService.decryptData(encryptedContent, fileId);
+        // V1: Legacy
+        if (onProgress) onProgress(10);
+        const content = await RNFS.readFile(metadata.encryptedPath, 'utf8');
+        if (onProgress) onProgress(50);
+        const decryptedString = await SecurityService.decryptDataChunked(content, fileId);
+        if (onProgress) onProgress(90);
+        await RNFS.writeFile(destPath, decryptedString, 'base64');
       }
 
       if (onProgress) onProgress(100);
-
-      return decryptedContent;
+      return `file://${destPath}`;
     } catch (error) {
-      console.error("Read secure file error:", error);
+      console.error("Decryption failed:", error);
       return null;
     }
   }
 
-  // Delete secure file
+  // Read Secure File (Legacy Compat - returns string)
+  // WARNING: Will crash on large files. Use only for small files/thumbnails
+  async readSecureFile(fileId: string, onProgress?: (p: number) => void): Promise<string | null> {
+    const uri = await this.getSecureFileUri(fileId);
+    if (!uri) return null;
+    if (onProgress) onProgress(100);
+    // Read back as base64 string
+    return await RNFS.readFile(uri.replace('file://', ''), 'base64');
+  }
+
+  // Delete
   async deleteSecureFile(fileId: string): Promise<boolean> {
+    const metadata = SecurityService.getAllFileMetadata().find(f => f.id === fileId);
+    if (!metadata) return false;
     try {
-      const metadata = SecurityService.getAllFileMetadata().find(
-        (f) => f.id === fileId,
-      );
-      if (!metadata) {
-        return false;
-      }
-
-      // Delete encrypted file
-      await FileSystem.deleteAsync(metadata.encryptedPath, {
-        idempotent: true,
-      });
-
-      // Remove metadata
+      if (await RNFS.exists(metadata.encryptedPath)) await RNFS.unlink(metadata.encryptedPath);
+      const thumbPath = `${this.THUMBNAIL_DIR}${fileId}.thumb`;
+      if (await RNFS.exists(thumbPath)) await RNFS.unlink(thumbPath);
       SecurityService.deleteFileMetadata(fileId);
-
       return true;
-    } catch (error) {
-      console.error("Delete secure file error:", error);
+    } catch (e) {
       return false;
     }
   }
 
-  // Get file icon based on type (returns Ionicons name)
+  // Download (restore)
+  async downloadFile(fileId: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const uri = await this.getSecureFileUri(fileId);
+      if (!uri) throw new Error("Decryption failed");
+
+      const metadata = SecurityService.getAllFileMetadata().find(f => f.id === fileId);
+
+      if (Platform.OS === 'android') {
+        // Save to Download folder
+        // Need permission? modern android uses MediaStore or SAF. 
+        // RNFS.DownloadDirectoryPath works usually.
+        const dest = `${RNFS.DownloadDirectoryPath}/${metadata?.originalName}`;
+        await RNFS.copyFile(uri.replace('file://', ''), dest);
+        return { success: true, message: `Saved to ${dest}` };
+      } else {
+        // Share sheet
+        // expo-sharing or save to media lib
+        if (await MediaLibrary.getPermissionsAsync().then(r => r.granted)) {
+          await MediaLibrary.saveToLibraryAsync(uri);
+          return { success: true, message: "Saved to Photos" };
+        }
+        return { success: false, message: "Permission denied" };
+      }
+    } catch (error: any) {
+      return { success: false, message: error.message };
+    }
+  }
+
+  // Helpers
+  async getThumbnail(fileId: string): Promise<string | null> {
+    try {
+      const path = `${this.THUMBNAIL_DIR}${fileId}.thumb`;
+      if (await RNFS.exists(path)) {
+        const enc = await RNFS.readFile(path, 'utf8');
+        return SecurityService.decryptData(enc, `${fileId}_thumb`);
+      }
+    } catch { }
+    return null;
+  }
+
   getFileIcon(fileType: string): string {
     if (fileType.startsWith("image/")) return "image-outline";
     if (fileType.startsWith("video/")) return "videocam-outline";
     if (fileType.startsWith("audio/")) return "musical-notes-outline";
     if (fileType.includes("pdf")) return "document-text-outline";
-    if (fileType.includes("word") || fileType.includes("document"))
-      return "document-outline";
-    if (fileType.includes("excel") || fileType.includes("sheet"))
-      return "grid-outline";
-    if (fileType.includes("zip") || fileType.includes("rar"))
-      return "archive-outline";
+    if (fileType.includes("word") || fileType.includes("document")) return "document-outline";
+    if (fileType.includes("excel") || fileType.includes("sheet")) return "grid-outline";
+    if (fileType.includes("zip") || fileType.includes("rar")) return "archive-outline";
     return "folder-outline";
   }
 
-  // Format file size
   formatFileSize(bytes: number): string {
     if (bytes === 0) return "0 Bytes";
     const k = 1024;
@@ -787,206 +539,9 @@ class FileService {
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];
   }
-  // Download file to device storage (with background processing)
-  async downloadFile(
-    fileId: string,
-  ): Promise<{ success: boolean; message: string; fileName?: string; operationId?: string }> {
-    const metadata = SecurityService.getAllFileMetadata().find(
-      (f) => f.id === fileId,
-    );
-    if (!metadata) {
-      return { success: false, message: "File not found" };
-    }
 
-    const operationId = `download_${fileId}_${Date.now()}`;
-    
-    // Create operation tracker
-    const operation: FileOperation = {
-      id: operationId,
-      type: 'download',
-      fileName: metadata.originalName,
-      progress: 0,
-      status: 'processing',
-    };
-    this.activeOperations.set(operationId, operation);
-    
-    // Start background service (will show progress notification)
-    // await this.createPersistentNotification(operationId, operation);
-    this.activeBackgroundOperations++;
-    await this.startBackgroundService();
-
-    // Run download in background-style async operation
-    this.performDownload(fileId, operationId).catch(error => {
-      console.error('Background download failed:', error);
-    });
-
-    return {
-      success: true,
-      message: `Downloading ${metadata.originalName}...`,
-      fileName: metadata.originalName,
-      operationId,
-    };
-  }
-
-  // Perform download operation (runs in background)
-  private async performDownload(fileId: string, operationId: string): Promise<void> {
-    try {
-      const metadata = SecurityService.getAllFileMetadata().find(
-        (f) => f.id === fileId,
-      );
-      if (!metadata) {
-        throw new Error("File not found");
-      }
-
-      // Decrypt the file with progress
-      this.updateOperation(operationId, { progress: 5 });
-      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-      
-      const decryptedContent = await this.readSecureFile(fileId, (progress) => {
-        if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-        this.updateOperation(operationId, { progress: 5 + (progress * 0.7) }); // 5-75%
-      });
-      
-      if (!decryptedContent) {
-        throw new Error("Failed to decrypt file");
-      }
-
-      this.updateOperation(operationId, { progress: 80 });
-      if (this.isCancelled(operationId)) throw new Error('Cancelled by user');
-
-      // For images and videos, save to media library
-      if (
-        metadata.fileType.startsWith("image/") ||
-        metadata.fileType.startsWith("video/")
-      ) {
-        // Request permissions
-        const { status } = await MediaLibrary.requestPermissionsAsync();
-        if (status !== "granted") {
-          throw new Error("Media library permissions not granted");
-        }
-
-        this.updateOperation(operationId, { progress: 85 });
-
-        // Create temporary file
-        const tempPath = `${FileSystem.cacheDirectory}${metadata.originalName}`;
-        await FileSystem.writeAsStringAsync(tempPath, decryptedContent, {
-          encoding: "base64" as any,
-        });
-
-        this.updateOperation(operationId, { progress: 92 });
-
-        // Save to media library
-        await MediaLibrary.createAssetAsync(tempPath);
-
-        // Delete temp file
-        await FileSystem.deleteAsync(tempPath, { idempotent: true });
-
-        this.updateOperation(operationId, { progress: 100, status: 'completed' });
-        
-        // Stop background service if no more operations
-        // await this.removePersistentNotification(operationId);
-        this.activeBackgroundOperations--;
-        if (this.activeBackgroundOperations === 0) {
-          await this.stopBackgroundService();
-        }
-        
-        await this.showNotification(
-          "Download Complete ✓",
-          `${metadata.originalName} saved to gallery`
-        );
-      } else {
-        // For other files, save to Downloads directory
-        const downloadPath =
-          Platform.OS === "android"
-            ? `${FileSystem.documentDirectory}../Download/${metadata.originalName}`
-            : `${FileSystem.documentDirectory}${metadata.originalName}`;
-
-        this.updateOperation(operationId, { progress: 90 });
-
-        await FileSystem.writeAsStringAsync(downloadPath, decryptedContent, {
-          encoding: "base64" as any,
-        });
-
-        this.updateOperation(operationId, { progress: 100, status: 'completed' });
-        
-        // Stop background service if no more operations
-        // await this.removePersistentNotification(operationId);
-        this.activeBackgroundOperations--;
-        if (this.activeBackgroundOperations === 0) {
-          await this.stopBackgroundService();
-        }
-        
-        await this.showNotification(
-          "Download Complete ✓",
-          `${metadata.originalName} saved to Downloads`
-        );
-      }
-
-      // Clean up operation after delay
-      setTimeout(() => this.activeOperations.delete(operationId), 3000);
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      this.updateOperation(operationId, { 
-        status: 'failed', 
-        error: errorMsg 
-      });
-      
-      // Stop background service if no more operations
-      // await this.removePersistentNotification(operationId);
-      this.activeBackgroundOperations--;
-      if (this.activeBackgroundOperations === 0) {
-        await this.stopBackgroundService();
-      }
-      
-      await this.showNotification(
-        "Download Failed ✗",
-        `Failed to download file: ${errorMsg}`
-      );
-    }
-  }
-
-  // Get all active operations
-  getActiveOperations(): FileOperation[] {
-    return Array.from(this.activeOperations.values());
-  }
-
-  // Get specific operation
-  getOperation(operationId: string): FileOperation | undefined {
-    return this.activeOperations.get(operationId);
-  }
-
-  // Check if operation is cancelled
-  private isCancelled(operationId: string): boolean {
-    return this.cancelledOperations.has(operationId);
-  }
-
-  // Cancel operation
-  async cancelOperation(operationId: string): Promise<void> {
-    const operation = this.activeOperations.get(operationId);
-    if (operation && operation.status === 'processing') {
-      // Mark as cancelled
-      this.cancelledOperations.add(operationId);
-      operation.status = 'failed';
-      operation.error = 'Cancelled by user';
-      
-      // Decrement background operations counter
-      this.activeBackgroundOperations--;
-      if (this.activeBackgroundOperations === 0) {
-        await this.stopBackgroundService();
-      }
-      
-      // Show cancellation notification
-      await this.showNotification(
-        "Operation Cancelled",
-        `${operation.fileName} has been cancelled`
-      );
-      
-      // Clean up after delay
-      setTimeout(() => {
-        this.activeOperations.delete(operationId);
-        this.cancelledOperations.delete(operationId);
-      }, 2000);
-    }
+  private getExtension(filename: string): string {
+    return filename.split('.').pop() || 'dat';
   }
 }
 

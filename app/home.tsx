@@ -7,18 +7,18 @@ import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-    ActivityIndicator,
-    Alert,
-    FlatList,
-    Image,
-    Modal,
-    RefreshControl,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  Image,
+  Modal,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -43,12 +43,12 @@ export default function HomeScreen() {
     // Load files and initialize storage (authentication already verified by _layout.tsx)
     loadFiles();
     FileService.initializeSecureStorage();
-    
+
     // Poll for active operations
     const interval = setInterval(() => {
       setActiveOperations(FileService.getActiveOperations());
     }, 500);
-    
+
     return () => clearInterval(interval);
   }, []);
 
@@ -110,10 +110,10 @@ export default function HomeScreen() {
       }
 
       // Load full content with progress
-      const content = await FileService.readSecureFile(file.id, (progress) => {
+      const uri = await FileService.getSecureFileUri(file.id, (progress) => {
         setPreviewProgress(progress);
       });
-      setPreviewContent(content);
+      setPreviewContent(uri);
       setPreviewProgress(100);
     } catch (error) {
       Alert.alert("Error", "Failed to decrypt file");
@@ -291,10 +291,10 @@ export default function HomeScreen() {
             {activeOperations.map((op) => (
               <View key={op.id} style={styles.operationCard}>
                 <View style={styles.operationHeader}>
-                  <SimpleIcon 
-                    name={op.type === 'upload' ? 'cloud-upload-outline' : 'cloud-download-outline'} 
-                    size={20} 
-                    color="#4a90e2" 
+                  <SimpleIcon
+                    name={op.type === 'upload' ? 'cloud-upload-outline' : 'cloud-download-outline'}
+                    size={20}
+                    color="#4a90e2"
                   />
                   <Text style={styles.operationName} numberOfLines={1}>
                     {op.fileName}
@@ -311,8 +311,8 @@ export default function HomeScreen() {
                           `Cancel ${op.type === 'upload' ? 'encrypting' : 'downloading'} ${op.fileName}?`,
                           [
                             { text: 'No', style: 'cancel' },
-                            { 
-                              text: 'Yes, Cancel', 
+                            {
+                              text: 'Yes, Cancel',
                               style: 'destructive',
                               onPress: () => FileService.cancelOperation(op.id)
                             }
@@ -325,14 +325,14 @@ export default function HomeScreen() {
                   )}
                 </View>
                 <View style={styles.progressBarBg}>
-                  <View 
+                  <View
                     style={[
-                      styles.progressBarFill, 
-                      { 
+                      styles.progressBarFill,
+                      {
                         width: `${op.progress}%`,
                         backgroundColor: op.status === 'failed' ? '#ff4444' : '#4a90e2'
                       }
-                    ]} 
+                    ]}
                   />
                 </View>
                 {op.status === 'failed' && (
@@ -522,13 +522,13 @@ export default function HomeScreen() {
                       <SimpleIcon name="shield-checkmark" size={48} color="#4a90e2" />
                     </View>
                   </View>
-                  
+
                   {/* Status Text */}
                   <Text style={styles.decryptionTitle}>Decrypting File</Text>
                   <Text style={styles.decryptionSubtitle}>
                     Securely unlocking your content...
                   </Text>
-                  
+
                   {/* Progress Percentage */}
                   <View style={styles.progressPercentContainer}>
                     <Text style={styles.progressPercentText}>
@@ -536,26 +536,26 @@ export default function HomeScreen() {
                     </Text>
                     <Text style={styles.progressPercentSymbol}>%</Text>
                   </View>
-                  
+
                   {/* Progress Bar */}
                   {previewProgress > 0 && (
                     <View style={styles.modernProgressBarContainer}>
                       <View style={styles.modernProgressBarBg}>
-                        <View 
+                        <View
                           style={[
-                            styles.modernProgressBarFill, 
+                            styles.modernProgressBarFill,
                             { width: `${previewProgress}%` }
-                          ]} 
+                          ]}
                         />
                       </View>
                       <Text style={styles.progressStatusText}>
                         {previewProgress < 30 ? 'Reading encrypted data...' :
-                         previewProgress < 70 ? 'Decrypting content...' :
-                         previewProgress < 95 ? 'Finalizing...' : 'Almost done!'}
+                          previewProgress < 70 ? 'Decrypting content...' :
+                            previewProgress < 95 ? 'Finalizing...' : 'Almost done!'}
                       </Text>
                     </View>
                   )}
-                  
+
                   {/* Security Badge */}
                   <View style={styles.securityBadge}>
                     <SimpleIcon name="lock-closed" size={14} color="#4a90e2" />
@@ -565,20 +565,20 @@ export default function HomeScreen() {
               ) : (
                 <View style={styles.previewContainer}>
                   {selectedFile?.fileType.startsWith("image/") &&
-                  previewContent ? (
+                    previewContent ? (
                     <Image
                       source={{
-                        uri: `data:${selectedFile.fileType};base64,${previewContent}`,
+                        uri: previewContent.startsWith('file://') ? previewContent : `data:${selectedFile.fileType};base64,${previewContent}`,
                       }}
                       style={styles.previewImage}
                       resizeMode="contain"
                     />
                   ) : selectedFile?.fileType.startsWith("video/") &&
-                  previewContent ? (
+                    previewContent ? (
                     <Video
                       ref={videoRef}
                       source={{
-                        uri: `data:${selectedFile.fileType};base64,${previewContent}`,
+                        uri: previewContent.startsWith('file://') ? previewContent : `data:${selectedFile.fileType};base64,${previewContent}`,
                       }}
                       style={styles.previewVideo}
                       useNativeControls
@@ -588,7 +588,7 @@ export default function HomeScreen() {
                     />
                   ) : (
                     <View style={styles.filePreviewInfo}>
-                      <SimpleIcon 
+                      <SimpleIcon
                         name={FileService.getFileIcon(selectedFile?.fileType || "") as any}
                         size={80}
                         color="#4a90e2"
