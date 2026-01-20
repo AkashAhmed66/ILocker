@@ -7,12 +7,12 @@ import React, { useRef, useState } from "react";
 import {
     ActivityIndicator,
     Alert,
-    SafeAreaView,
     StyleSheet,
     Text,
     TouchableOpacity,
     View
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function CameraScreen() {
     const router = useRouter();
@@ -129,7 +129,7 @@ export default function CameraScreen() {
     };
 
     return (
-        <SafeAreaView style={styles.container}>
+        <SafeAreaView style={styles.container} edges={['top', 'bottom', 'left', 'right']}>
             <StatusBar style="light" />
             <CameraView
                 style={styles.camera}

@@ -480,6 +480,17 @@ class FileService {
     }
   }
 
+  // Rename
+  async renameFile(fileId: string, newName: string): Promise<boolean> {
+    try {
+      SecurityService.updateFileMetadata(fileId, { originalName: newName });
+      return true;
+    } catch (error) {
+      console.error("Rename failed:", error);
+      return false;
+    }
+  }
+
   // Download (restore)
   async downloadFile(fileId: string): Promise<{ success: boolean; message: string }> {
     try {

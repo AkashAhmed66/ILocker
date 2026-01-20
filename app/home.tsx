@@ -11,14 +11,16 @@ import {
   Alert,
   FlatList,
   Image,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  View,
+  View
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -36,6 +38,9 @@ export default function HomeScreen() {
   const [showFilePreview, setShowFilePreview] = useState(false);
   const [selectedFile, setSelectedFile] = useState<FileMetadata | null>(null);
   const [previewContent, setPreviewContent] = useState<string | null>(null);
+  const [showRenameModal, setShowRenameModal] = useState(false);
+  const [renamingFile, setRenamingFile] = useState<FileMetadata | null>(null);
+  const [newFileName, setNewFileName] = useState("");
   const [oldPassword, setOldPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmNewPassword, setConfirmNewPassword] = useState("");
@@ -272,6 +277,33 @@ export default function HomeScreen() {
     ]);
   };
 
+  const handleRenameFile = (file: FileMetadata) => {
+    setRenamingFile(file);
+    setNewFileName(file.originalName);
+    setShowRenameModal(true);
+  };
+
+  const executeRename = async () => {
+    if (!renamingFile || !newFileName.trim()) return;
+
+    setLoading(true);
+    try {
+      const success = await FileService.renameFile(renamingFile.id, newFileName.trim());
+      if (success) {
+        loadFiles();
+        setShowRenameModal(false);
+        setRenamingFile(null);
+        Alert.alert("Success", "File renamed successfully");
+      } else {
+        Alert.alert("Error", "Failed to rename file");
+      }
+    } catch (error) {
+      Alert.alert("Error", "Failed to rename file");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleChangePassword = async () => {
     if (newPassword.length < 6) {
       Alert.alert("Error", "New password must be at least 6 characters");
@@ -371,6 +403,15 @@ export default function HomeScreen() {
               style={styles.actionButton}
               onPress={(e) => {
                 e.stopPropagation();
+                handleRenameFile(item);
+              }}
+            >
+              <SimpleIcon name="pencil-outline" size={20} color="#fff" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.actionButton}
+              onPress={(e) => {
+                e.stopPropagation();
                 handleDownloadFile(item);
               }}
             >
@@ -403,7 +444,7 @@ export default function HomeScreen() {
   );
 
   return (
-    <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
+    <SafeAreaView style={styles.container} edges={["top", "bottom", "left", "right"]}>
       <StatusBar style="light" />
       <LinearGradient colors={["#0f0f0f", "#1a1a2e"]} style={styles.gradient}>
         {/* Header (Normal vs Selection) */}
@@ -568,6 +609,46 @@ export default function HomeScreen() {
         <TouchableOpacity style={styles.fab} onPress={() => setShowMenu(true)}>
           <Text style={styles.fabIcon}>+</Text>
         </TouchableOpacity>
+
+        {/* Rename Modal */}
+        <Modal visible={showRenameModal} transparent animationType="fade">
+          <KeyboardAvoidingView
+            behavior={Platform.OS === "ios" ? "padding" : "height"}
+            style={styles.modalOverlay}
+          >
+            <ScrollView
+              contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }}
+              keyboardShouldPersistTaps="handled"
+            >
+              <View style={[styles.menuContainer, { paddingBottom: 24, margin: 20, borderRadius: 24 }]}>
+                <Text style={[styles.sectionTitle, { color: '#fff', marginBottom: 20 }]}>Rename File</Text>
+                <TextInput
+                  style={styles.settingsInput}
+                  value={newFileName}
+                  onChangeText={setNewFileName}
+                  placeholder="Enter new name"
+                  placeholderTextColor="#666"
+                  autoFocus
+                  selectTextOnFocus
+                />
+                <View style={{ flexDirection: 'row', gap: 12, marginTop: 12 }}>
+                  <TouchableOpacity
+                    style={[styles.changePasswordButton, { flex: 1, backgroundColor: '#2a2a3e', marginTop: 0 }]}
+                    onPress={() => setShowRenameModal(false)}
+                  >
+                    <Text style={styles.changePasswordText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.changePasswordButton, { flex: 1, marginTop: 0 }]}
+                    onPress={executeRename}
+                  >
+                    <Text style={styles.changePasswordText}>Rename</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </Modal>
 
         {/* Add Menu Modal */}
         <Modal visible={showMenu} transparent animationType="fade">
@@ -833,7 +914,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 20,
-    paddingTop: 60,
+    paddingTop: 12,
     paddingBottom: 20,
   },
   headerTitle: {
@@ -1042,7 +1123,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 20,
-    paddingTop: 60,
+    paddingTop: 12,
     paddingBottom: 20,
   },
   settingsTitle: {
@@ -1107,7 +1188,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 20,
-    paddingTop: 60,
+    paddingTop: 12,
     paddingBottom: 20,
   },
   previewTitle: {
@@ -1301,7 +1382,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#1a1a2e",
     borderRadius: 12,
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingVertical: 2,
     marginBottom: 12,
     borderWidth: 1,
     borderColor: "#2a2a3e",
@@ -1346,7 +1427,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 20,
-    paddingTop: 60,
+    paddingTop: 12,
     paddingBottom: 20,
     backgroundColor: "#1a1a2e",
     borderBottomWidth: 1,

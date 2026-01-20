@@ -477,6 +477,20 @@ class SecurityService {
     }
   }
 
+  // Update file metadata
+  updateFileMetadata(fileId: string, updates: Partial<FileMetadata>): void {
+    const allFiles = this.getAllFileMetadata();
+    const index = allFiles.findIndex(f => f.id === fileId);
+    if (index !== -1) {
+      allFiles[index] = { ...allFiles[index], ...updates };
+      const filesJson = JSON.stringify(allFiles);
+      storage.set('files', filesJson);
+      if (storage._cache) {
+        storage._cache['files'] = filesJson;
+      }
+    }
+  }
+
   // Get all file metadata
   getAllFileMetadata(): FileMetadata[] {
     const filesJson = storage.getString('files');
